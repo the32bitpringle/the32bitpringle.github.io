@@ -1,0 +1,158 @@
+import type { ReaderSettings, ReadingMode, SensoryPreset } from '../types'
+
+export const modePresets: Record<ReadingMode, Partial<ReaderSettings>> = {
+  skim: { wpm: 420, chunkSize: 4, microBreakInterval: 60, microBreakDuration: 6 },
+  'deep-focus': { wpm: 280, chunkSize: 2, microBreakInterval: 40, microBreakDuration: 8 },
+  study: { wpm: 210, chunkSize: 1, microBreakInterval: 24, microBreakDuration: 12 },
+}
+
+export const sensoryPresets: Record<SensoryPreset, Partial<ReaderSettings>> = {
+  neutral: {
+    theme: 'paper',
+    contrast: 'balanced',
+    focusWindow: false,
+    motionSmoothing: false,
+    toneIndicators: true,
+    showRoleHighlights: false,
+    audioMode: 'off',
+  },
+  calm: {
+    theme: 'paper',
+    contrast: 'soft',
+    focusWindow: true,
+    focusWindowWidth: 'wide',
+    focusWindowStrength: 35,
+    motionSmoothing: true,
+    audioMode: 'brown-noise',
+  },
+  crisp: {
+    theme: 'paper',
+    contrast: 'high',
+    focusWindow: true,
+    focusWindowWidth: 'narrow',
+    focusWindowStrength: 55,
+    motionSmoothing: false,
+    audioMode: 'off',
+  },
+  'low-stim': {
+    theme: 'eink',
+    contrast: 'soft',
+    focusWindow: true,
+    focusWindowWidth: 'balanced',
+    focusWindowStrength: 62,
+    toneIndicators: false,
+    showRoleHighlights: false,
+    audioMode: 'off',
+  },
+}
+
+export const defaultSettings: ReaderSettings = {
+  version: 2,
+  wpm: 280,
+  chunkSize: 2,
+  fontSize: 72,
+  fontWeight: 400,
+  fontFamily: "'Times New Roman', serif",
+  mode: 'deep-focus',
+  theme: 'paper',
+  contrast: 'balanced',
+  textColor: '#091717',
+  backgroundColor: '#fbfaf4',
+  showFocusPoint: true,
+  showRoleHighlights: false,
+  eyeAnchor: false,
+  eyeAnchorStyle: 'line',
+  focusWindow: false,
+  focusWindowWidth: 'balanced',
+  focusWindowStrength: 40,
+  adaptivePacing: false,
+  focusRamp: false,
+  microBreaks: false,
+  microBreakInterval: 40,
+  microBreakDuration: 8,
+  driftRecovery: false,
+  motionSmoothing: false,
+  autoHideTitle: false,
+  autoHideFocusUi: false,
+  autoHideTitleDelay: 2,
+  contextLadder: false,
+  clarityPauses: false,
+  dopamineFeedback: false,
+  quickSenseChecks: false,
+  aiMicroQuizzes: false,
+  aiSymbolGrouping: false,
+  aiContext: false,
+  semanticAiRerank: false,
+  restartPrimer: true,
+  voiceCommands: false,
+  eyeTracking: false,
+  resurfaceQueue: false,
+  showMilestones: true,
+  toneIndicators: true,
+  audioMode: 'off',
+  audioVolume: 20,
+  sensoryPreset: 'neutral',
+  sprintMinutes: 0,
+  backgroundMediaUrl: '',
+  backgroundMediaType: 'none',
+  backgroundOpacity: 100,
+  backgroundBlur: 0,
+  backgroundDim: 35,
+  backgroundPlaybackRate: 1,
+  backgroundPaused: false,
+  backgroundLoop: true,
+  shortsformWpm: 260,
+  shortsformCaptionMaxWords: 5,
+  shortsformSubtitleScale: 100,
+  shortsformSubtitleStyle: 'emphasis',
+  shortsformSubtitleCase: 'uppercase',
+  shortsformCaptionAlign: 'center',
+  shortsformTts: true,
+  shortsformTtsRate: 1,
+  shortsformTtsPitch: 1,
+  shortsformTtsVoice: 'en-US-AriaNeural',
+  hotkeys: {
+    playPause: 'Space',
+    previous: 'ArrowLeft',
+    next: 'ArrowRight',
+    focusMode: 'F',
+    narration: 'H',
+    settings: 'S',
+    textView: 'V',
+  },
+  calibrationComplete: false,
+  profile: {
+    comfortableWpm: 280,
+    preferredChunkSize: 2,
+    breakToleranceSeconds: 8,
+    preferredWpmMin: 220,
+    preferredWpmMax: 340,
+  },
+}
+
+export function mergeSettings(value?: Partial<ReaderSettings> | null): ReaderSettings {
+  const migrated = migrateSettings(value)
+  return {
+    ...defaultSettings,
+    ...migrated,
+    hotkeys: { ...defaultSettings.hotkeys, ...migrated.hotkeys },
+    profile: { ...defaultSettings.profile, ...migrated.profile },
+    version: 2,
+  }
+}
+
+function migrateSettings(value?: Partial<ReaderSettings> | null): Partial<ReaderSettings> {
+  if (!value) return {}
+  const version = Number(value.version ?? 0)
+  if (version >= 2) return value
+  return {
+    ...value,
+    autoHideFocusUi: value.autoHideFocusUi ?? false,
+    backgroundOpacity: value.backgroundOpacity ?? 100,
+    backgroundBlur: value.backgroundBlur ?? 0,
+    backgroundDim: value.backgroundDim ?? 35,
+    backgroundPlaybackRate: value.backgroundPlaybackRate ?? 1,
+    backgroundPaused: value.backgroundPaused ?? false,
+    backgroundLoop: value.backgroundLoop ?? true,
+  }
+}

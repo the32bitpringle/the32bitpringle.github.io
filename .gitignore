@@ -1,0 +1,7 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+.shortsform-cache/
+.env.local
+*.tsbuildinfo
