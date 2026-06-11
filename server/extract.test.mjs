@@ -1,8 +1,17 @@
 // @vitest-environment node
 import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import JSZip from 'jszip'
 import { describe, expect, it } from 'vitest'
-import { buildSrt, extractDocument, isYoutubeUrl, normalizeExportSections } from './index.mjs'
+import {
+  buildSrt,
+  extractDocument,
+  findMediaFile,
+  isYoutubeUrl,
+  normalizeExportSections,
+  youtubeFormatSelector,
+} from './index.mjs'
 
 describe('server document extraction', () => {
   it('extracts TXT and HTML', async () => {
@@ -10,6 +19,17 @@ describe('server document extraction', () => {
     const html = await extractDocument(Buffer.from('<h1>Chapter 1</h1><p>A readable HTML chapter.</p>'), '.html', 'sample.html')
     expect(txt.sections[0].text).toContain('plain-text')
     expect(html.sections[0].text).toContain('HTML chapter')
+  })
+
+  it('extracts Markdown without formatting syntax', async () => {
+    const markdown = await extractDocument(
+      Buffer.from('# Chapter 1\n\nA **readable** [Markdown passage](https://example.com).'),
+      '.md',
+      'sample.md',
+    )
+    expect(markdown.format).toBe('markdown')
+    expect(markdown.sections[0].text).toContain('readable Markdown passage')
+    expect(markdown.sections[0].text).not.toContain('https://example.com')
   })
 
   it('extracts a real DOCX fixture', async () => {
@@ -52,6 +72,22 @@ describe('Shortsform inputs', () => {
     expect(isYoutubeUrl('https://youtu.be/abc123')).toBe(true)
     expect(isYoutubeUrl('http://youtube.com/watch?v=abc123')).toBe(false)
     expect(isYoutubeUrl('https://example.com/video.mp4')).toBe(false)
+  })
+
+  it('prefers browser-compatible 720p H.264 YouTube footage', () => {
+    expect(youtubeFormatSelector).toContain('height<=720')
+    expect(youtubeFormatSelector).toContain('vcodec^=avc1')
+  })
+
+  it('finds every accepted uploaded video extension', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'celere-footage-'))
+    try {
+      const videoPath = path.join(directory, 'source.m4v')
+      fs.writeFileSync(videoPath, 'video')
+      expect(findMediaFile(directory)).toBe(videoPath)
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
   })
 
   it('normalizes non-empty chapter text without rewriting it', () => {

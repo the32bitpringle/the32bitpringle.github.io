@@ -210,11 +210,51 @@ export function buildShortsformChunks(document: ParsedDocument, maxWords = 18): 
   return chunks
 }
 
+export function buildNarrationPassages(document: ParsedDocument, maxWords = 240): ReadingChunk[] {
+  const passages: ReadingChunk[] = []
+  let cursor = 0
+  const targetSize = Math.max(40, maxWords)
+
+  while (cursor < document.tokens.length) {
+    const start = cursor
+    const first = document.tokens[cursor]
+    const passageTokens: Token[] = []
+
+    while (cursor < document.tokens.length && passageTokens.length < targetSize) {
+      const token = document.tokens[cursor]
+      const sectionChanged = token.source.sectionIndex !== first.source.sectionIndex
+      if (passageTokens.length > 0 && sectionChanged) break
+      passageTokens.push(token)
+      cursor += 1
+
+      const reachedParagraphEnd = document.tokens[cursor]?.source.paragraphIndex !== token.source.paragraphIndex
+      if (passageTokens.length >= Math.floor(targetSize * 0.72) && reachedParagraphEnd) break
+    }
+
+    const end = cursor - 1
+    passages.push({
+      id: `narration:${start}:${end}`,
+      text: tokensToText(passageTokens),
+      tokens: passageTokens,
+      startWordIndex: start,
+      endWordIndex: end,
+      sectionIndex: first.source.sectionIndex,
+      paragraphIndex: first.source.paragraphIndex,
+      sentenceStart: start === 0 || SENTENCE_END.test(document.tokens[start - 1]?.text ?? ''),
+      sentenceEnd: SENTENCE_END.test(document.tokens[end]?.text ?? ''),
+      complexity: passageTokens.reduce((sum, token) => sum + (token.difficult ? 1 : 0), 0),
+    })
+  }
+
+  return passages
+}
+
 export function getChunkDelay(chunk: ReadingChunk, wpm: number, clarityPauses: boolean) {
-  const base = Math.max(150, (60_000 / Math.max(wpm, 1)) * chunk.tokens.length)
+  const base = (60_000 / Math.max(wpm, 1)) * chunk.tokens.length
+  if (!clarityPauses) return base
   const clause = CLAUSE_END.test(chunk.text) ? 120 : 0
   const sentence = chunk.sentenceEnd ? 240 : 0
-  const difficult = clarityPauses ? chunk.complexity * 160 : 0
+  const difficult = chunk.complexity * 160
   return base + clause + sentence + difficult
 }
 

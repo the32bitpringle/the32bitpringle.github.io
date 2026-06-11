@@ -39,6 +39,16 @@ button {
   color: inherit;
 }
 
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+}
+
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
@@ -135,13 +145,6 @@ label:has(input:focus-visible) {
 .app-shell.manual-focus-mode .dock-action[title="Narration"],
 .app-shell.manual-focus-mode .dock-action[title="Stop narration"] {
   display: grid;
-}
-
-.narrated-token {
-  color: var(--focus-red);
-  text-decoration: underline;
-  text-decoration-thickness: 0.08em;
-  text-underline-offset: 0.12em;
 }
 
 .app-shell.focus-ui-hidden .topbar {
@@ -509,6 +512,11 @@ label:has(input:focus-visible) {
   text-align: center;
 }
 
+.display-line.narration-active {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+
 .focus-letter {
   color: var(--focus-red);
   font-weight: inherit;
@@ -527,6 +535,103 @@ label:has(input:focus-visible) {
 
 .role-key {
   background: var(--accent-soft);
+}
+
+.word-focus-page {
+  position: relative;
+  grid-template-rows: minmax(0, 1fr) 5px auto;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.word-focus-scroll {
+  position: relative;
+  z-index: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scroll-behavior: auto;
+  scrollbar-color: var(--line) transparent;
+}
+
+.word-focus-document {
+  width: min(980px, calc(100% - 48px));
+  margin: 0 auto;
+  padding: clamp(54px, 8vh, 108px) 0 38vh;
+  color: var(--text);
+  font-family: var(--focus-document-font, var(--reader-font));
+  font-size: clamp(20px, calc(var(--reader-size) * 0.43), 50px);
+  font-weight: var(--reader-weight);
+  line-height: 1.45;
+  letter-spacing: -0.025em;
+}
+
+.word-focus-document section + section {
+  margin-top: 2.4em;
+}
+
+.word-focus-document h2 {
+  margin: 1.7em 0 0.85em;
+  color: var(--text);
+  font: inherit;
+  font-size: 1.2em;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.word-focus-document p {
+  margin: 0 0 1.05em;
+}
+
+.word-focus-token {
+  border-radius: 3px;
+  cursor: pointer;
+  transition: color 100ms ease, background-color 100ms ease;
+}
+
+.word-focus-token.active {
+  background: var(--accent-soft);
+  color: #17242a;
+  box-shadow: 0 0 0 0.08em var(--accent-soft);
+  font-weight: max(600, var(--reader-weight));
+}
+
+.word-focus-empty {
+  position: relative;
+  z-index: 1;
+  place-self: center;
+  width: min(620px, 88vw);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 32px 0;
+}
+
+.word-focus-empty p {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.word-focus-empty label,
+.word-focus-empty button {
+  width: fit-content;
+  border: 1px solid var(--text);
+  background: var(--text);
+  color: var(--bg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 13px;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.focus-window .word-focus-document p:not(.active-paragraph) {
+  opacity: max(0.18, calc(1 - var(--focus-strength)));
+}
+
+.motion-smooth .word-focus-scroll {
+  scroll-behavior: smooth;
 }
 
 .tone-alert .reader-status span:nth-child(2) {
@@ -595,6 +700,14 @@ label:has(input:focus-visible) {
   padding: 11px 14px;
   cursor: pointer;
   font-size: 12px;
+}
+
+.secondary-button {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  padding: 9px 11px;
+  cursor: pointer;
+  font-size: 11px;
 }
 
 .error {
@@ -877,6 +990,13 @@ label:has(input:focus-visible) {
   color: var(--muted);
   font-size: 9px;
   line-height: 1.55;
+}
+
+.settings-status {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
 }
 
 .shortsform-mode {
@@ -1407,6 +1527,153 @@ label:has(input:focus-visible) {
   font: 400 32px/1 "Instrument Serif", serif;
 }
 
+.import-dialog {
+  width: min(860px, 96vw);
+  padding: 0;
+}
+
+.import-dialog > header {
+  padding: 18px 20px;
+}
+
+.import-dialog > header > div {
+  min-width: 0;
+}
+
+.import-dialog > header p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.import-layout {
+  min-height: 430px;
+  display: grid;
+  grid-template-columns: 210px minmax(0, 1fr);
+}
+
+.import-sources {
+  border-right: 1px solid var(--line);
+}
+
+.import-sources button {
+  width: 100%;
+  min-height: 52px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  display: grid;
+  grid-template-columns: 24px 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+  text-align: left;
+}
+
+.import-sources button.active {
+  background: var(--text);
+  color: var(--bg);
+}
+
+.import-sources svg {
+  width: 17px;
+  height: 17px;
+}
+
+.import-panel {
+  padding: 24px;
+}
+
+.import-panel h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.import-panel > p {
+  max-width: 620px;
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.import-file-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+}
+
+.import-file-grid label {
+  min-height: 118px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  align-content: center;
+  gap: 7px;
+  padding: 18px;
+  cursor: pointer;
+}
+
+.import-file-grid label:hover {
+  background: var(--accent-soft);
+}
+
+.import-file-grid strong {
+  font-size: 13px;
+}
+
+.import-file-grid span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.import-field {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+  font-size: 10px;
+}
+
+.import-field input,
+.import-field select,
+.import-field textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--surface);
+  color: var(--text);
+  padding: 11px;
+  resize: vertical;
+}
+
+.import-field textarea {
+  min-height: 150px;
+  line-height: 1.55;
+}
+
+.import-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+
+.import-panel > button,
+.import-actions > button {
+  border-color: var(--text);
+  background: var(--text);
+  color: var(--bg);
+}
+
+.import-panel button:disabled,
+.import-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .modal > header button,
 .semantic-modal > header button {
   width: 34px;
@@ -1722,15 +1989,31 @@ kbd {
 
 @media (max-width: 780px) {
   .topbar {
-    grid-template-columns: auto 1fr auto;
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .wordmark {
+    padding: 0 10px;
+    font-size: 21px;
+  }
+
+  .topbar nav {
+    min-width: 0;
   }
 
   .topbar-meta span {
     display: none;
   }
 
+  .topbar-meta button {
+    display: none;
+  }
+
   .topbar nav button {
-    min-width: 70px;
+    flex: 1;
+    min-width: 0;
+    padding: 0 4px;
+    font-size: 9px;
   }
 
   .reader-stage {
@@ -1757,6 +2040,47 @@ kbd {
 
   .settings-panel {
     grid-template-columns: 1fr;
+  }
+
+  .import-dialog {
+    max-height: 94vh;
+  }
+
+  .import-layout {
+    min-height: 0;
+    grid-template-columns: 1fr;
+  }
+
+  .import-sources {
+    overflow-x: auto;
+    display: flex;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .import-sources button {
+    flex: 0 0 118px;
+    min-height: 58px;
+    grid-template-columns: 1fr;
+    gap: 4px;
+    justify-items: start;
+    border-right: 1px solid var(--line);
+    border-bottom: 0;
+    font-size: 9px;
+  }
+
+  .import-panel {
+    padding: 18px;
+  }
+
+  .import-file-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .word-focus-document {
+    width: min(100% - 32px, 980px);
+    padding-top: 36px;
+    font-size: clamp(18px, calc(var(--reader-size) * 0.36), 34px);
   }
 
   .guide-page {

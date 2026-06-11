@@ -1,6 +1,7 @@
 import type {
   AiQuiz,
   AiSearchAnswer,
+  NarrationCast,
   SemanticSearchResult,
   SymbolGroupingHints,
 } from '../types'
@@ -47,4 +48,17 @@ export function analyzeSymbolGrouping(sample: string, title: string, signal?: Ab
 
 export function classifyComplexity(sample: string, signal?: AbortSignal) {
   return postJson<{ difficultWords: string[] }>('/api/complexity', { sample }, signal)
+}
+
+export function analyzeNarrationCast(
+  sample: string,
+  title: string,
+  voices: Array<{ gender?: string; locale?: string; name: string }>,
+  signal?: AbortSignal,
+) {
+  return postJson<NarrationCast>('/api/narration-cast', {
+    sample,
+    title,
+    voices: voices.slice(0, 40),
+  }, signal)
 }

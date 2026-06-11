@@ -1,6 +1,8 @@
 import fs from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
+import dns from 'node:dns/promises'
+import net from 'node:net'
 import path from 'node:path'
 import cors from 'cors'
 import express from 'express'
@@ -26,6 +28,7 @@ const defaultEdgeTtsVoice = process.env.EDGE_TTS_DEFAULT_VOICE ?? 'en-US-AriaNeu
 const ffmpegCommand = process.env.FFMPEG_PATH ?? 'ffmpeg'
 const ffprobeCommand = process.env.FFPROBE_PATH ?? 'ffprobe'
 const ytDlpCommand = process.env.YT_DLP_PATH ?? 'yt-dlp'
+const youtubeFormatSelector = 'bv*[height<=720][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[height<=720][vcodec^=avc1][ext=mp4]/bv*[height<=720]+ba/b[height<=720]'
 const footageUpload = multer({
   storage: multer.diskStorage({
     destination: (_request, _file, callback) => {
@@ -53,6 +56,23 @@ app.post('/api/extract', upload.single('file'), async (request, response) => {
     response.json(await extractDocument(request.file.buffer, path.extname(request.file.originalname).toLowerCase(), request.file.originalname))
   } catch (error) {
     response.status(422).json({ error: error instanceof Error ? error.message : 'The document could not be parsed.' })
+  }
+})
+
+app.post('/api/extract-url', async (request, response) => {
+  try {
+    const sourceUrl = String(request.body?.url ?? '').trim()
+    const result = await fetchImportSource(sourceUrl)
+    const finalUrl = new URL(result.url)
+    const extension = extensionForRemoteDocument(finalUrl.pathname, result.contentType)
+    const fileName = decodeURIComponent(path.posix.basename(finalUrl.pathname)) || finalUrl.hostname
+    const extracted = await extractDocument(result.buffer, extension, fileName)
+    if ((extension === '.html' || extension === '.htm') && extracted.title === readableTitle(fileName)) {
+      extracted.title = extractHtmlTitle(result.buffer.toString('utf8')) || finalUrl.hostname
+    }
+    response.json({ ...extracted, sourceName: result.url })
+  } catch (error) {
+    response.status(422).json({ error: error instanceof Error ? error.message : 'The website could not be imported.' })
   }
 })
 
@@ -108,6 +128,38 @@ app.post('/api/complexity', async (request, response) => {
     }))
   } catch (error) {
     response.status(502).json({ error: error instanceof Error ? error.message : 'Complexity analysis failed.' })
+  }
+})
+
+app.post('/api/narration-cast', async (request, response) => {
+  if (!openRouterApiKey) return response.status(503).json({ error: 'AI narration casting is not configured.' })
+  const voices = Array.isArray(request.body?.voices)
+    ? request.body.voices.slice(0, 40).map((voice) => ({
+        gender: String(voice?.gender ?? ''),
+        locale: String(voice?.locale ?? ''),
+        name: String(voice?.name ?? ''),
+      })).filter((voice) => voice.name)
+    : []
+  if (!voices.length) return response.status(400).json({ error: 'No narration voices are available.' })
+  try {
+    const cast = await askGemma({
+      system: 'Detect recurring story characters and cast fitting voices from the supplied voice list. Return strict JSON: {"narratorVoice":string,"characters":[{"name":string,"aliases":string[],"voiceName":string}]}. Use only exact supplied voice names. Include at most 12 characters. Infer age, tone, and gender only when supported by the text; otherwise choose a neutral fitting voice. Do not invent characters.',
+      input: {
+        title: String(request.body?.title ?? '').slice(0, 200),
+        sample: String(request.body?.sample ?? '').slice(0, 14_000),
+        voices,
+      },
+      validate: (value) => typeof value?.narratorVoice === 'string' && Array.isArray(value?.characters),
+    })
+    const voiceNames = new Set(voices.map((voice) => voice.name))
+    response.json({
+      narratorVoice: voiceNames.has(cast.narratorVoice) ? cast.narratorVoice : voices[0].name,
+      characters: cast.characters.slice(0, 12).filter((character) =>
+        typeof character?.name === 'string' && voiceNames.has(character?.voiceName),
+      ),
+    })
+  } catch (error) {
+    response.status(502).json({ error: error instanceof Error ? error.message : 'Narration casting failed.' })
   }
 })
 
@@ -215,7 +267,7 @@ app.post('/api/shortsform/footage', async (request, response) => {
       '--restrict-filenames',
       '--write-info-json',
       '--merge-output-format', 'mp4',
-      '-f', 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720][ext=mp4]/best[height<=720]',
+      '-f', youtubeFormatSelector,
       '-o', path.join(assetDir, 'source.%(ext)s'),
       sourceUrl,
     ], { timeoutMs: 10 * 60_000, signal: controller.signal })
@@ -404,9 +456,13 @@ export async function extractDocument(buffer, extension, fileName) {
     }
     return { format: 'doc', title, sections: splitSections(text) }
   }
-  if (extension === '.txt') {
+  if (extension === '.txt' || extension === '.md' || extension === '.markdown') {
     const text = normalizeText(buffer.toString('utf8'))
-    return { format: 'txt', title, sections: splitSections(text) }
+    return {
+      format: extension === '.txt' ? 'txt' : 'markdown',
+      title,
+      sections: splitSections(extension === '.txt' ? text : markdownToText(text)),
+    }
   }
   if (extension === '.html' || extension === '.htm') {
     const source = buffer.toString('utf8')
@@ -420,7 +476,7 @@ export async function extractDocument(buffer, extension, fileName) {
     return { format: 'html', title, sections: splitSections(text) }
   }
   if (extension === '.epub') return extractEpub(buffer, title)
-  throw new Error('Unsupported file type. Use PDF, EPUB, DOC, DOCX, TXT, or HTML.')
+  throw new Error('Unsupported file type. Use PDF, EPUB, Markdown, DOC, DOCX, TXT, or HTML.')
 }
 
 async function extractEpub(buffer, fallbackTitle) {
@@ -485,8 +541,124 @@ function normalizeText(text) {
   return text.replace(/\r/g, '\n').replace(/\u0000/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').replace(/[ \t]{2,}/g, ' ').trim()
 }
 
+function markdownToText(markdown) {
+  return normalizeText(markdown
+    .replace(/```[\s\S]*?```/g, (block) => block.replace(/^```\w*\s*|\s*```$/g, ''))
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/^\s{0,3}(?:[-*+]|\d+\.)\s+/gm, '')
+    .replace(/^\s{0,3}>\s?/gm, '')
+    .replace(/^\s*[-*_]{3,}\s*$/gm, '')
+    .replace(/[*_~`]+/g, ''))
+}
+
 function readableTitle(fileName) {
   return fileName.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim()
+}
+
+async function fetchImportSource(value, redirectCount = 0) {
+  if (redirectCount > 4) throw new Error('The website redirected too many times.')
+  const url = await validateImportUrl(value)
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 15_000)
+  try {
+    const result = await fetch(url, {
+      redirect: 'manual',
+      signal: controller.signal,
+      headers: {
+        Accept: 'text/html,application/xhtml+xml,text/plain,text/markdown,application/pdf,application/epub+zip',
+        'User-Agent': 'CelereReader/2.0',
+      },
+    })
+    if (result.status >= 300 && result.status < 400) {
+      const location = result.headers.get('location')
+      if (!location) throw new Error('The website returned an invalid redirect.')
+      return fetchImportSource(new URL(location, url).toString(), redirectCount + 1)
+    }
+    if (!result.ok) throw new Error(`The website returned HTTP ${result.status}.`)
+    const length = Number(result.headers.get('content-length') ?? 0)
+    if (length > 50 * 1024 * 1024) throw new Error('The remote document exceeds the 50 MB import limit.')
+    const reader = result.body?.getReader()
+    const chunks = []
+    let total = 0
+    while (reader) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > 50 * 1024 * 1024) {
+        await reader.cancel()
+        throw new Error('The remote document exceeds the 50 MB import limit.')
+      }
+      chunks.push(Buffer.from(value))
+    }
+    return {
+      buffer: Buffer.concat(chunks),
+      contentType: result.headers.get('content-type')?.split(';')[0].trim().toLowerCase() ?? '',
+      url: result.url || url.toString(),
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function validateImportUrl(value) {
+  let url
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error('Enter a valid public website URL.')
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    throw new Error('Enter a public HTTP or HTTPS website URL.')
+  }
+  const addresses = await dns.lookup(url.hostname, { all: true })
+  if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) {
+    throw new Error('Local and private network addresses cannot be imported.')
+  }
+  return url
+}
+
+function isPrivateAddress(address) {
+  if (net.isIPv4(address)) {
+    const parts = address.split('.').map(Number)
+    return parts[0] === 10
+      || parts[0] === 127
+      || parts[0] === 0
+      || (parts[0] === 169 && parts[1] === 254)
+      || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+      || (parts[0] === 192 && parts[1] === 168)
+      || (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127)
+      || parts[0] >= 224
+  }
+  const normalized = address.toLowerCase().split('%')[0]
+  return normalized === '::'
+    || normalized === '::1'
+    || normalized.startsWith('fc')
+    || normalized.startsWith('fd')
+    || normalized.startsWith('fe8')
+    || normalized.startsWith('fe9')
+    || normalized.startsWith('fea')
+    || normalized.startsWith('feb')
+    || normalized.startsWith('::ffff:127.')
+    || normalized.startsWith('::ffff:10.')
+    || normalized.startsWith('::ffff:192.168.')
+}
+
+function extensionForRemoteDocument(pathname, contentType) {
+  const extension = path.posix.extname(pathname).toLowerCase()
+  if (['.pdf', '.epub', '.md', '.markdown', '.txt', '.html', '.htm'].includes(extension)) return extension
+  if (contentType === 'application/pdf') return '.pdf'
+  if (contentType === 'application/epub+zip') return '.epub'
+  if (contentType === 'text/markdown') return '.md'
+  if (contentType === 'text/plain') return '.txt'
+  if (['text/html', 'application/xhtml+xml'].includes(contentType)) return '.html'
+  throw new Error('This URL does not point to a supported webpage or document.')
+}
+
+function extractHtmlTitle(source) {
+  const document = new DOMParser().parseFromString(source, 'text/html')
+  return normalizeText(document.getElementsByTagName('title')[0]?.textContent ?? '').slice(0, 200)
 }
 
 async function zipText(archive, filePath) {
@@ -592,7 +764,7 @@ function isAssetId(value) {
 
 function findMediaFile(directory) {
   if (!fs.existsSync(directory)) return null
-  const name = fs.readdirSync(directory).find((entry) => /\.(mp4|webm|mov|mkv)$/i.test(entry))
+  const name = fs.readdirSync(directory).find((entry) => /\.(mp4|webm|mov|mkv|m4v)$/i.test(entry))
   return name ? path.join(directory, name) : null
 }
 
@@ -705,4 +877,4 @@ function escapeFilterPath(filePath) {
   return filePath.replaceAll('\\', '\\\\').replaceAll(':', '\\:').replaceAll("'", "\\'")
 }
 
-export { buildSrt, isYoutubeUrl, normalizeExportSections }
+export { buildSrt, findMediaFile, isYoutubeUrl, normalizeExportSections, youtubeFormatSelector }

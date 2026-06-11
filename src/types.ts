@@ -1,11 +1,11 @@
 export type ReadingMode = 'skim' | 'deep-focus' | 'study'
-export type ReaderTheme = 'light' | 'paper' | 'dark' | 'eink' | 'high-contrast'
+export type ReaderTheme = 'light' | 'paper' | 'sepia' | 'dark' | 'eink' | 'high-contrast'
 export type ContrastMode = 'soft' | 'balanced' | 'high'
-export type AudioMode = 'off' | 'brown-noise' | 'binaural-beats' | 'metronome'
+export type AudioMode = 'off' | 'brown-noise' | 'binaural-beats' | 'metronome' | 'soft-drums'
 export type SensoryPreset = 'neutral' | 'calm' | 'crisp' | 'low-stim'
 export type FocusWindowWidth = 'narrow' | 'balanced' | 'wide'
 export type EyeAnchorStyle = 'line' | 'grid'
-export type AppPage = 'reader' | 'shortsform' | 'guide'
+export type AppPage = 'reader' | 'focus' | 'shortsform' | 'guide'
 export type ShortsformSubtitleStyle = 'emphasis' | 'window' | 'plain' | 'karaoke' | 'outline' | 'block' | 'shadow'
 export type ShortsformSubtitleCase = 'uppercase' | 'natural'
 export type ShortsformCaptionAlign = 'center' | 'left'
@@ -21,6 +21,17 @@ export interface SymbolGroupingHints {
   standalone: string[]
   notes: string[]
   languageCode?: string
+}
+
+export interface NarrationCharacterVoice {
+  aliases: string[]
+  name: string
+  voiceName: string
+}
+
+export interface NarrationCast {
+  characters: NarrationCharacterVoice[]
+  narratorVoice: string
 }
 
 export interface SourcePosition {

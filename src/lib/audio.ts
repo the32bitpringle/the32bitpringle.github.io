@@ -3,6 +3,7 @@ import type { AudioMode } from '../types'
 export class AmbientAudio {
   private context: AudioContext | null = null
   private stopCurrent: (() => void) | null = null
+  private wordPulseGain: GainNode | null = null
 
   async start(mode: AudioMode, volume: number, pace: number) {
     this.stop()
@@ -12,6 +13,15 @@ export class AmbientAudio {
     const gain = this.context.createGain()
     gain.gain.value = Math.max(0, Math.min(volume / 100, 1)) * 0.16
     gain.connect(this.context.destination)
+
+    if (mode === 'soft-drums') {
+      this.wordPulseGain = gain
+      this.stopCurrent = () => {
+        this.wordPulseGain = null
+        gain.disconnect()
+      }
+      return
+    }
 
     if (mode === 'brown-noise') {
       const buffer = this.context.createBuffer(1, this.context.sampleRate * 2, this.context.sampleRate)
@@ -67,8 +77,40 @@ export class AmbientAudio {
     this.stopCurrent = () => { active = false; if (timer) clearTimeout(timer); gain.disconnect() }
   }
 
+  async pulseWord(volume: number) {
+    this.context ??= new AudioContext({ latencyHint: 'interactive' })
+    await this.context.resume()
+    if (!this.wordPulseGain) {
+      this.wordPulseGain = this.context.createGain()
+      this.wordPulseGain.gain.value = Math.max(0, Math.min(volume / 100, 1)) * 0.18
+      this.wordPulseGain.connect(this.context.destination)
+    }
+
+    const now = this.context.currentTime
+    const oscillator = this.context.createOscillator()
+    const envelope = this.context.createGain()
+    const filter = this.context.createBiquadFilter()
+    oscillator.type = 'sine'
+    oscillator.frequency.setValueAtTime(105, now)
+    oscillator.frequency.exponentialRampToValueAtTime(48, now + 0.11)
+    filter.type = 'lowpass'
+    filter.frequency.value = 190
+    envelope.gain.setValueAtTime(0.0001, now)
+    envelope.gain.exponentialRampToValueAtTime(0.7, now + 0.008)
+    envelope.gain.exponentialRampToValueAtTime(0.0001, now + 0.14)
+    oscillator.connect(filter).connect(envelope).connect(this.wordPulseGain)
+    oscillator.start(now)
+    oscillator.stop(now + 0.15)
+    oscillator.onended = () => {
+      oscillator.disconnect()
+      filter.disconnect()
+      envelope.disconnect()
+    }
+  }
+
   stop() {
     this.stopCurrent?.()
     this.stopCurrent = null
+    this.wordPulseGain = null
   }
 }

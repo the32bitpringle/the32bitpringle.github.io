@@ -9,6 +9,100 @@ test('reader and guide remain keyboard accessible', async ({ page }) => {
   await expect(page.getByPlaceholder('Search features…')).toBeVisible()
 })
 
+test('reader imports pasted Markdown and exposes guided ebook sources', async ({ page }) => {
+  await page.route('**/api/grouping', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ prefixes: [], suffixes: [], joiners: [], standalone: [], notes: [], languageCode: 'en' }),
+  }))
+  await page.route('**/api/complexity', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ difficultWords: [] }),
+  }))
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Skip' }).click()
+  await page.getByRole('button', { name: 'Add reading' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Import reading' })
+  await expect(dialog.getByRole('button', { name: 'Kindle Cloud Reader' })).toBeVisible()
+  await expect(dialog.getByRole('button', { name: 'Libby' })).toBeVisible()
+  await dialog.getByRole('button', { name: 'Paste text' }).click()
+  await dialog.getByLabel('Title', { exact: true }).fill('Pasted guide')
+  await dialog.getByLabel('Format', { exact: true }).selectOption('markdown')
+  await dialog.getByLabel('Text', { exact: true }).fill('# Opening\n\nA **clear** passage imported from Markdown.')
+  await dialog.getByRole('button', { name: 'Import text' }).click()
+  await expect(page.locator('.reader-header strong')).toHaveText('Pasted guide')
+  await expect(page.locator('.word-display')).toContainText('clear')
+})
+
+test('Word Focus highlights the active word in the document and shares Reader settings', async ({ page }) => {
+  await page.route('**/api/tts', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ audioBase64: 'SUQz', timings: [] }),
+    })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Skip' }).click()
+  await page.getByLabel('Reader controls').getByLabel('Upload').setInputFiles({
+    name: 'word-focus.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('Focused reading keeps each word clear and centered.'),
+  })
+  await page.getByRole('navigation', { name: 'Pages' }).getByRole('button', { name: 'Word Focus' }).click()
+
+  await expect(page.locator('.word-focus-document')).toContainText('Focused reading keeps each word clear and centered.')
+  await expect(page.locator('.word-focus-token.active')).toHaveText('Focused')
+  await expect(page.getByLabel('Word Focus controls')).toBeVisible()
+
+  await page.getByLabel('Word Focus controls').getByTitle('Settings').click()
+  await page.getByLabel('Theme').selectOption('sepia')
+  await page.getByLabel('Words per minute').fill('600')
+  await expect(page.locator('.app-shell')).toHaveClass(/theme-sepia/)
+  await expect(page.locator('.word-focus-document')).toHaveCSS('font-family', 'Georgia, serif')
+  await expect(page.getByLabel('Narration pace')).toBeVisible()
+  await page.getByLabel('Ambient audio').selectOption('soft-drums')
+  await expect(page.getByLabel('Ambient audio')).toHaveValue('soft-drums')
+  await page.getByLabel('Word Focus controls').getByTitle('Close').click()
+
+  await page.getByLabel('Word Focus controls').getByTitle('Narration').click()
+  await expect(page.getByLabel('Word Focus controls').getByTitle('Pause')).toBeVisible()
+  await expect(page.locator('.word-focus-token.active')).toHaveCount(1)
+  await expect(page.locator('.word-focus-token.active')).not.toHaveText('Focused', { timeout: 1500 })
+})
+
+test('Word Focus stays responsive with one active word in a long document', async ({ page }) => {
+  const longPassage = Array.from(
+    { length: 2500 },
+    (_, index) => `reading${index}`,
+  ).join(' ')
+
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Skip' }).click()
+  await page.getByLabel('Reader controls').getByLabel('Upload').setInputFiles({
+    name: 'long-word-focus.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from(longPassage),
+  })
+  await page.getByRole('navigation', { name: 'Pages' }).getByRole('button', { name: 'Word Focus' }).click()
+  await expect(page.locator('.word-focus-token')).toHaveCount(2500)
+  await expect(page.locator('.word-focus-token.active')).toHaveCount(1)
+
+  const dock = page.getByLabel('Word Focus controls')
+  await dock.getByTitle('Settings').click()
+  await page.getByLabel('Words per minute').fill('1200')
+  await dock.getByTitle('Close').click()
+
+  const activeIndex = () => page.evaluate(() => {
+    const tokens = [...document.querySelectorAll('.word-focus-token')]
+    return tokens.indexOf(document.querySelector('.word-focus-token.active')!)
+  })
+  const initialIndex = await activeIndex()
+  await dock.getByTitle('Play').click()
+
+  await expect.poll(activeIndex, { timeout: 1000 }).toBeGreaterThan(initialIndex + 2)
+  await expect(page.locator('.word-focus-token.active')).toHaveCount(1)
+})
+
 test('semantic search opens from the keyboard', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('button', { name: 'Skip' }).click()
@@ -68,6 +162,24 @@ test('Shortsform mirrors the original live caption mode with rights-gated playba
   await page.getByLabel('Edge TTS narration').uncheck()
   await page.getByLabel('I own this footage or have permission to download and reuse it.').check()
   await expect(page.getByLabel('Upload video')).toBeEnabled()
+  await page.route('**/api/shortsform/footage/upload', async (route) => {
+    expect(route.request().method()).toBe('POST')
+    expect(await route.request().headerValue('content-type')).toContain('multipart/form-data')
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        assetId: '00000000-0000-4000-8000-000000000000',
+        previewUrl: '/api/shortsform/footage/00000000-0000-4000-8000-000000000000',
+        title: 'uploaded clip',
+      }),
+    })
+  })
+  await page.getByLabel('Upload video').setInputFiles({
+    name: 'uploaded-clip.m4v',
+    mimeType: 'video/x-m4v',
+    buffer: Buffer.from('video'),
+  })
+  await expect(page.locator('.shortsform-status')).toHaveText('Footage ready: uploaded clip')
   await page.getByPlaceholder('https://www.youtube.com/watch?v=…').fill('https://www.youtube.com/watch?v=authorized')
   await expect(page.getByRole('button', { name: 'Prepare footage' })).toBeEnabled()
   await page.route('**/api/shortsform/footage', async (route) => {
@@ -79,7 +191,8 @@ test('Shortsform mirrors the original live caption mode with rights-gated playba
   await page.getByRole('button', { name: 'Cancel preparation' }).click()
   await expect(page.locator('.shortsform-status')).toHaveText('Footage preparation cancelled.')
 
-  await page.getByLabel('Upload file').setInputFiles({
+  await page.getByRole('button', { name: 'Upload file' }).click()
+  await page.getByRole('dialog', { name: 'Import reading' }).locator('input[type="file"]').nth(2).setInputFiles({
     name: 'shortsform-test.txt',
     mimeType: 'text/plain',
     buffer: Buffer.from('These live captions advance one word at a time. The second sentence remains in the shared reading timeline.'),
@@ -95,6 +208,32 @@ test('Shortsform mirrors the original live caption mode with rights-gated playba
   await page.getByRole('button', { name: 'Play' }).click()
   await expect(page.locator('.shortsform-caption-line .word-being-narrated')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Pause' })).toBeVisible()
+})
+
+test('Shortsform WPM advances captions while narration is still preparing', async ({ page }) => {
+  await page.route('**/api/tts', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ audioBase64: 'SUQz', timings: [] }),
+    })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Skip' }).click()
+  await page.getByRole('navigation', { name: 'Pages' }).getByRole('button', { name: 'Shortsform' }).click()
+  await page.getByRole('button', { name: 'Settings' }).click()
+  await page.getByLabel(/Speed/).fill('600')
+  await page.getByRole('button', { name: 'Upload file' }).click()
+  await page.getByRole('dialog', { name: 'Import reading' }).locator('input[type="file"]').nth(2).setInputFiles({
+    name: 'shortsform-wpm.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('One two three four five six seven eight nine ten.'),
+  })
+  await page.getByLabel('I own this text or have permission to narrate it.').check()
+  await page.getByRole('button', { name: 'Close settings' }).click()
+  await page.getByRole('button', { name: 'Play' }).click()
+
+  await expect(page.locator('.shortsform-caption-line .word-already-narrated')).toBeVisible({ timeout: 1000 })
 })
 
 test('dark mode and focus auto-hide remain user controlled', async ({ page }) => {
@@ -218,7 +357,7 @@ test('settings controls persist their values and visual modes', async ({ page })
   await expect(page.getByLabel('Section milestones')).not.toBeChecked()
 })
 
-test('reader narration requests natural Edge TTS phrases without restarting for every visual chunk', async ({ page }) => {
+test('reader narration requests sentence-sized phrases without visual-timer restarts', async ({ page }) => {
   await page.addInitScript(() => {
     Object.defineProperty(HTMLMediaElement.prototype, 'duration', {
       configurable: true,
@@ -254,15 +393,123 @@ test('reader narration requests natural Edge TTS phrases without restarting for 
   await page.getByLabel('Reader controls').getByLabel('Upload').setInputFiles({
     name: 'narration-test.txt',
     mimeType: 'text/plain',
-    buffer: Buffer.from('This complete sentence should be narrated naturally instead of restarting after every displayed chunk.'),
+    buffer: Buffer.from('This complete sentence should be narrated naturally. The next sentence must remain in the same continuous audio passage.'),
   })
   await page.getByLabel('Reader controls').getByTitle('Narration').click()
-  await page.getByLabel('Reader controls').getByTitle('Play').click()
   await page.waitForTimeout(6200)
 
-  expect(narrationRequests).toHaveLength(1)
-  expect(narrationRequests[0]).toMatchObject({
-    rate: '-30%',
-    text: 'This complete sentence should be narrated naturally instead of restarting after every displayed chunk.',
+  expect(narrationRequests.map((request) => request.text)).toEqual(expect.arrayContaining([
+    'This complete sentence should be narrated naturally.',
+    'The next sentence must remain in the same continuous audio passage.',
+  ]))
+  expect(narrationRequests.every((request) => request.rate === '-30%')).toBe(true)
+})
+
+test('reader narration highlights phrases without underlining individual words', async ({ page }) => {
+  await page.route('**/api/tts', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ audioBase64: 'SUQz', timings: [] }),
+    })
   })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Skip' }).click()
+  await page.getByLabel('Reader controls').getByLabel('Upload').setInputFiles({
+    name: 'reader-wpm.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('One two three. Four five six. Seven eight nine.'),
+  })
+  await page.getByLabel('Reader controls').getByTitle('Settings').click()
+  await page.getByLabel('Words per minute', { exact: true }).fill('200')
+  await page.getByLabel('Reader controls').getByTitle('Close').click()
+  await page.getByLabel('Reader controls').getByTitle('Narration').click()
+
+  await expect(page.locator('.display-line.narration-active')).toContainText('One two three.')
+  await expect(page.locator('.word-display')).toContainText('Four five six.', { timeout: 1200 })
+  await expect(page.locator('.display-line.narration-active')).toHaveCSS('text-decoration-line', 'none')
+})
+
+test('reader narration falls back to browser speech when Edge TTS fails', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.speechSynthesis, 'cancel', { configurable: true, value: () => {} })
+    Object.defineProperty(window.speechSynthesis, 'speak', {
+      configurable: true,
+      value: (utterance: SpeechSynthesisUtterance) => {
+        queueMicrotask(() => utterance.onstart?.(new Event('start') as SpeechSynthesisEvent))
+      },
+    })
+  })
+  await page.route('**/api/tts', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'simulated Edge TTS failure' }),
+      status: 503,
+    })
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Skip' }).click()
+  await page.getByLabel('Reader controls').getByLabel('Upload').setInputFiles({
+    name: 'fallback.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('Browser speech keeps narration available when network audio fails.'),
+  })
+  await page.getByLabel('Reader controls').getByTitle('Narration').click()
+  await expect(page.getByText('Narrating Narrator with browser voice')).toBeVisible()
+})
+
+test('reader narration applies an AI-assigned character voice to attributed dialogue', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(HTMLMediaElement.prototype, 'duration', {
+      configurable: true,
+      get: () => 2,
+    })
+    HTMLMediaElement.prototype.load = function load() {
+      queueMicrotask(() => this.dispatchEvent(new Event('loadedmetadata')))
+    }
+    HTMLMediaElement.prototype.play = async function play() {
+      this.dispatchEvent(new Event('play'))
+    }
+    HTMLMediaElement.prototype.pause = function pause() {}
+  })
+  await page.route('**/api/tts/voices', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify([
+      { display_name: 'Aria', gender: 'Female', locale: 'en-US', name: 'en-US-AriaNeural' },
+      { display_name: 'Guy', gender: 'Male', locale: 'en-US', name: 'en-US-GuyNeural' },
+    ]),
+  }))
+  await page.route('**/api/narration-cast', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      narratorVoice: 'en-US-AriaNeural',
+      characters: [{ name: 'Alice', aliases: [], voiceName: 'en-US-GuyNeural' }],
+    }),
+  }))
+  const requestedVoices: string[] = []
+  await page.route('**/api/tts', async (route) => {
+    const body = route.request().postDataJSON() as { text: string; voice: string }
+    requestedVoices.push(body.voice)
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        audioBase64: 'SUQz',
+        timings: body.text.split(/\s+/).map((text, index) => ({
+          durationMs: 100,
+          offsetMs: index * 120,
+          text,
+        })),
+      }),
+    })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Skip' }).click()
+  await page.getByLabel('Reader controls').getByLabel('Upload').setInputFiles({
+    name: 'cast-test.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('"Stay here," said Alice. Alice waited for an answer.'),
+  })
+  await page.getByLabel('Reader controls').getByTitle('Narration').click()
+  await expect.poll(() => requestedVoices).toContain('en-US-GuyNeural')
 })

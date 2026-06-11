@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   buildChunks,
+  buildNarrationPassages,
   buildShortsformChunks,
   createParsedDocument,
   findMeaningfulRewind,
@@ -52,6 +53,17 @@ describe('document tokenization', () => {
     )).toBe(true)
   })
 
+  it('builds multi-sentence narration passages without crossing sections', async () => {
+    const document = await fixture()
+    const passages = buildNarrationPassages(document, 40)
+    expect(passages[0].text).toContain('Alex waited quietly. Then Alex revealed the hidden map to Mira.')
+    expect(passages[0].text).toContain('Mira understood the secret.')
+    expect(passages).toHaveLength(2)
+    expect(passages.every((passage) =>
+      passage.tokens.every((token) => token.source.sectionIndex === passage.sectionIndex),
+    )).toBe(true)
+  })
+
   it('returns a sentence-aware rewind point', async () => {
     const chunks = buildChunks(await fixture(), 2, 'deep-focus')
     const target = findMeaningfulRewind(chunks, Math.min(4, chunks.length - 1))
@@ -63,6 +75,13 @@ describe('document tokenization', () => {
     const document = await fixture()
     const chunk = buildChunks(document, 5, 'skim').find((item) => item.complexity > 0)!
     expect(getChunkDelay(chunk, 300, true)).toBeGreaterThan(getChunkDelay(chunk, 300, false))
+  })
+
+  it('uses the selected WPM exactly when clarity pauses are off', async () => {
+    const document = await fixture()
+    const chunk = buildChunks(document, 5, 'skim')[0]
+    expect(getChunkDelay(chunk, 300, false)).toBe(chunk.tokens.length * 200)
+    expect(getChunkDelay(buildChunks(document, 1, 'study')[0], 1000, false)).toBe(60)
   })
 
   it('selects a stable focus point and disables it for single CJK characters', () => {

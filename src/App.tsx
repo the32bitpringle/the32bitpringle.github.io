@@ -4,6 +4,7 @@ import {
   ArrowRight,
   BookOpen,
   Brain,
+  ClipboardPaste,
   CircleHelp,
   CirclePause,
   CirclePlay,
@@ -12,6 +13,8 @@ import {
   Flag,
   Focus,
   Gauge,
+  Globe2,
+  Library,
   ListRestart,
   MessageSquareText,
   Search,
@@ -26,14 +29,17 @@ import {
   type RefObject,
   type ReactNode,
   type KeyboardEvent as ReactKeyboardEvent,
+  memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from 'react'
 import { featureRegistry } from './config/features'
 import {
+  analyzeNarrationCast,
   analyzeSymbolGrouping,
   answerSemanticQuestion,
   classifyComplexity,
@@ -41,15 +47,18 @@ import {
   summarizeContext,
 } from './lib/ai'
 import { AmbientAudio } from './lib/audio'
-import { DOCUMENT_ACCEPT, importDocument } from './lib/documents'
+import { DOCUMENT_ACCEPT, importDocument, importText, importWebsite } from './lib/documents'
+import {
+  buildFallbackNarrationCast,
+  resolveNarrationVoice,
+  sanitizeNarrationCast,
+} from './lib/narration'
 import { PlaybackScheduler } from './lib/scheduler'
 import { exactSearch, ensureSemanticIndex, semanticSearch } from './lib/search'
 import {
   alignTtsTimings,
   base64ToAudioBlob,
-  getActiveTtsTimingIndex,
   getShortsformAudioPlaybackRate,
-  getTtsTimingIndex,
   type AlignedTtsWordTiming,
   type TtsWordTiming,
 } from './lib/shortsform'
@@ -81,6 +90,7 @@ import type {
   AiQuiz,
   AiSearchAnswer,
   AppPage,
+  NarrationCast,
   ParsedDocument,
   QueueItem,
   Reaction,
@@ -114,6 +124,7 @@ interface StreakState {
 
 interface ShortsformVoice {
   display_name: string
+  gender?: string
   locale?: string
   name: string
 }
@@ -168,6 +179,7 @@ function App() {
   const [chunkIndex, setChunkIndex] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [importing, setImporting] = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [overlay, setOverlay] = useState<Overlay>('none')
   const [overlaySeconds, setOverlaySeconds] = useState(0)
@@ -187,7 +199,8 @@ function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [focusMode, setFocusMode] = useState(false)
   const [narrationMode, setNarrationMode] = useState(false)
-  const [narratedWordIndex, setNarratedWordIndex] = useState(-1)
+  const [readerNarrationStatus, setReaderNarrationStatus] = useState('Off')
+  const [narrationCast, setNarrationCast] = useState<NarrationCast | null>(null)
   const [calibrationOpen, setCalibrationOpen] = useState(!loadSettings().calibrationComplete)
   const [semanticOpen, setSemanticOpen] = useState(false)
   const [semanticQuery, setSemanticQuery] = useState('')
@@ -207,7 +220,6 @@ function App() {
   const [shortsformTtsStatus, setShortsformTtsStatus] = useState('Loading Edge TTS voices…')
   const [shortsformWordIndex, setShortsformWordIndex] = useState(0)
   const [shortsformActiveWordIndex, setShortsformActiveWordIndex] = useState<number | null>(null)
-  const [shortsformAudioDurationMs, setShortsformAudioDurationMs] = useState(0)
 
   const scheduler = useRef(new PlaybackScheduler())
   const audio = useRef(new AmbientAudio())
@@ -227,9 +239,8 @@ function App() {
   const shortsformAudioUrlRef = useRef('')
   const readerNarrationAudioRef = useRef<HTMLAudioElement | null>(null)
   const readerNarrationAudioUrlRef = useRef('')
-  const readerNarrationFrameRef = useRef<number | null>(null)
+  const narrationCastDocumentRef = useRef('')
   const shortsformTtsCacheRef = useRef(new Map<string, Promise<ShortsformTtsAudio>>())
-  const shortsformAnimationFrameRef = useRef<number | null>(null)
   const shortsformRawAudioDurationRef = useRef(0)
   const shortsformTargetDurationRef = useRef(0)
   const shortsformTtsRateRef = useRef(settings.shortsformTtsRate)
@@ -238,18 +249,26 @@ function App() {
     () => document ? buildChunks(document, settings.chunkSize, settings.mode) : [],
     [document, settings.chunkSize, settings.mode],
   )
+  const focusChunks = useMemo(
+    () => document ? buildChunks(document, 1, 'study') : [],
+    [document],
+  )
   const shortsformChunks = useMemo(
     () => document ? buildShortsformChunks(document) : [],
     [document],
   )
-  const chunks = page === 'shortsform' ? shortsformChunks : readerChunks
+  const readerUsesSentenceChunks = narrationMode && page === 'reader'
+  const chunks = page === 'shortsform' || readerUsesSentenceChunks
+    ? shortsformChunks
+    : page === 'focus'
+      ? focusChunks
+      : readerChunks
   const safeChunkIndex = Math.min(chunkIndex, Math.max(chunks.length - 1, 0))
   const currentChunk = chunks[safeChunkIndex] ?? null
   readerWordIndexRef.current = currentChunk?.startWordIndex ?? 0
-  const readerNarrationChunkIndex = page === 'reader' && currentChunk
-    ? findChunkForWord(shortsformChunks, currentChunk.startWordIndex)
-    : 0
-  const readerNarrationChunk = shortsformChunks[readerNarrationChunkIndex] ?? null
+  const readerNarrationChunk = narrationMode && (page === 'reader' || page === 'focus') && currentChunk
+    ? shortsformChunks[findChunkForWord(shortsformChunks, currentChunk.startWordIndex)] ?? null
+    : null
   const progress = chunks.length > 1 ? safeChunkIndex / (chunks.length - 1) : 0
   const ramp = settings.focusRamp ? Math.min(1.12, 0.74 + stableChunks * 0.025) : 1
   const effectiveWpm = page === 'shortsform'
@@ -303,10 +322,19 @@ function App() {
 
   const navigateToPage = useCallback((nextPage: AppPage) => {
     const wordIndex = currentChunk?.startWordIndex ?? 0
-    const targetChunks = nextPage === 'shortsform' ? shortsformChunks : readerChunks
+    const targetChunks = nextPage === 'shortsform'
+      ? shortsformChunks
+      : nextPage === 'focus'
+        ? focusChunks
+        : readerChunks
     setChunkIndex(findChunkForWord(targetChunks, wordIndex))
+    setOverlay('none')
     setPage(nextPage)
-  }, [currentChunk?.startWordIndex, readerChunks, shortsformChunks])
+  }, [currentChunk?.startWordIndex, focusChunks, readerChunks, shortsformChunks])
+
+  const jumpToFocusWord = useCallback((wordIndex: number) => {
+    setChunkIndex(findChunkForWord(focusChunks, wordIndex))
+  }, [focusChunks])
 
   const persistPosition = useCallback(async (nextChunkIndex = safeChunkIndex) => {
     if (!document) return
@@ -377,14 +405,26 @@ function App() {
 
   const startPlayback = useCallback(() => {
     if (!document || chunks.length === 0) return
-    if (page !== 'shortsform' && safeChunkIndex === 0 && metrics.focusedSeconds === 0) {
+    if (settings.audioMode === 'soft-drums') {
+      void audio.current.start('soft-drums', settings.audioVolume, effectiveWpm)
+    }
+    if (page === 'reader' && safeChunkIndex === 0 && metrics.focusedSeconds === 0) {
       setOverlaySeconds(5)
       setOverlay('countdown')
       return
     }
     setOverlay('none')
     setPlaying(true)
-  }, [chunks.length, document, metrics.focusedSeconds, page, safeChunkIndex])
+  }, [
+    chunks.length,
+    document,
+    effectiveWpm,
+    metrics.focusedSeconds,
+    page,
+    safeChunkIndex,
+    settings.audioMode,
+    settings.audioVolume,
+  ])
 
   const togglePlayback = useCallback(() => {
     if (playing) {
@@ -395,6 +435,37 @@ function App() {
       startPlayback()
     }
   }, [playing, startPlayback])
+
+  const toggleNarration = useCallback(() => {
+    const wordIndex = currentChunk?.startWordIndex ?? 0
+    if (narrationMode) {
+      setNarrationMode(false)
+      setReaderNarrationStatus('Off')
+      const targetChunks = page === 'focus' ? focusChunks : readerChunks
+      setChunkIndex(findChunkForWord(targetChunks, wordIndex))
+      return
+    }
+    if (!document || shortsformChunks.length === 0) return
+    if (page === 'reader') setChunkIndex(findChunkForWord(shortsformChunks, wordIndex))
+    setNarrationMode(true)
+    setReaderNarrationStatus('Preparing narration…')
+    setOverlay('none')
+    if (settings.audioMode === 'soft-drums') {
+      void audio.current.start('soft-drums', settings.audioVolume, effectiveWpm)
+    }
+    setPlaying(true)
+  }, [
+    currentChunk?.startWordIndex,
+    document,
+    effectiveWpm,
+    focusChunks,
+    narrationMode,
+    page,
+    readerChunks,
+    settings.audioMode,
+    settings.audioVolume,
+    shortsformChunks,
+  ])
 
   const handleComprehension = useCallback((understood: boolean) => {
     setOverlay('none')
@@ -430,12 +501,6 @@ function App() {
     readerSpeech.preload = 'auto'
     readerNarrationAudioRef.current = readerSpeech
     return () => {
-      if (shortsformAnimationFrameRef.current !== null) {
-        cancelAnimationFrame(shortsformAnimationFrameRef.current)
-      }
-      if (readerNarrationFrameRef.current !== null) {
-        cancelAnimationFrame(readerNarrationFrameRef.current)
-      }
       speech.pause()
       readerSpeech.pause()
       if (shortsformAudioUrlRef.current) URL.revokeObjectURL(shortsformAudioUrlRef.current)
@@ -467,10 +532,46 @@ function App() {
     return () => { active = false }
   }, [])
 
-  const getShortsformTtsAudio = useCallback((chunk: ReadingChunk, rate = '+0%') => {
+  const fallbackNarrationCast = useMemo(
+    () => document && shortsformVoices.length
+      ? buildFallbackNarrationCast(document.text, shortsformVoices, settings.shortsformTtsVoice)
+      : null,
+    [document, settings.shortsformTtsVoice, shortsformVoices],
+  )
+
+  useEffect(() => {
+    if (!fallbackNarrationCast) {
+      setNarrationCast(null)
+      narrationCastDocumentRef.current = ''
+      return
+    }
+    setNarrationCast(fallbackNarrationCast)
+    if (!narrationMode || !document || narrationCastDocumentRef.current === document.id) return
+    narrationCastDocumentRef.current = document.id
+    const controller = new AbortController()
+    setReaderNarrationStatus('Casting story voices…')
+    void analyzeNarrationCast(
+      document.text.slice(0, 14_000),
+      document.title,
+      shortsformVoices,
+      controller.signal,
+    ).then((cast) => {
+      setNarrationCast(sanitizeNarrationCast(cast, shortsformVoices, fallbackNarrationCast))
+      setReaderNarrationStatus('Character voices ready')
+    }).catch(() => {
+      setReaderNarrationStatus('Using locally assigned character voices')
+    })
+    return () => controller.abort()
+  }, [document, fallbackNarrationCast, narrationMode, shortsformVoices])
+
+  const getShortsformTtsAudio = useCallback((
+    chunk: ReadingChunk,
+    rate = '+0%',
+    voice = settings.shortsformTtsVoice,
+  ) => {
     const key = [
       chunk.id,
-      settings.shortsformTtsVoice,
+      voice,
       settings.shortsformTtsPitch,
       rate,
     ].join('|')
@@ -482,7 +583,7 @@ function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         text: chunk.text,
-        voice: settings.shortsformTtsVoice,
+        voice,
         rate,
         pitch: toEdgeTtsPitch(settings.shortsformTtsPitch),
       }),
@@ -534,10 +635,6 @@ function App() {
   useEffect(() => {
     const speech = shortsformAudioRef.current
     const stopSpeech = () => {
-      if (shortsformAnimationFrameRef.current !== null) {
-        cancelAnimationFrame(shortsformAnimationFrameRef.current)
-        shortsformAnimationFrameRef.current = null
-      }
       if (speech) {
         speech.pause()
         speech.currentTime = 0
@@ -557,14 +654,12 @@ function App() {
     if (page !== 'shortsform' || !playing || !currentChunk) {
       setShortsformWordIndex(currentChunk?.startWordIndex ?? 0)
       setShortsformActiveWordIndex(null)
-      setShortsformAudioDurationMs(0)
       stopSpeech()
       return
     }
 
     setShortsformWordIndex(currentChunk.startWordIndex)
     setShortsformActiveWordIndex(null)
-    setShortsformAudioDurationMs(0)
     if (!settings.shortsformTts || !speech) {
       stopSpeech()
       return
@@ -573,7 +668,7 @@ function App() {
     setShortsformTtsStatus('Preparing narration…')
     let active = true
     void getShortsformTtsAudio(currentChunk)
-      .then(async ({ blob, timings }) => {
+      .then(async ({ blob }) => {
         if (!active) return
         const objectUrl = URL.createObjectURL(blob)
         shortsformAudioUrlRef.current = objectUrl
@@ -586,39 +681,15 @@ function App() {
             shortsformTtsRateRef.current,
           )
           speech.playbackRate = playbackRate
-          setShortsformAudioDurationMs(Math.round(rawDurationMs / playbackRate))
-        }
-        const updateWordFromAudio = () => {
-          if (!active || speech.paused || speech.ended) return
-          const spokenTimeMs = speech.currentTime * 1000
-          const timingIndex = getTtsTimingIndex(timings, spokenTimeMs)
-          const activeTimingIndex = getActiveTtsTimingIndex(timings, spokenTimeMs)
-          const timing = timings[timingIndex]
-          const activeTiming = timings[activeTimingIndex]
-          if (timing) setShortsformWordIndex(currentChunk.startWordIndex + timing.tokenOffset)
-          setShortsformActiveWordIndex(activeTiming
-            ? currentChunk.startWordIndex + activeTiming.tokenOffset
-            : null)
-          shortsformAnimationFrameRef.current = requestAnimationFrame(updateWordFromAudio)
         }
         speech.onplay = () => {
-          setShortsformWordIndex(currentChunk.startWordIndex)
-          setShortsformActiveWordIndex(null)
-          updateWordFromAudio()
+          setShortsformTtsStatus(`Narrating with ${settings.shortsformTtsVoice}.`)
         }
-        speech.onended = () => {
-          if (shortsformAnimationFrameRef.current !== null) {
-            cancelAnimationFrame(shortsformAnimationFrameRef.current)
-            shortsformAnimationFrameRef.current = null
-          }
-          setShortsformWordIndex(currentChunk.endWordIndex)
-          setShortsformActiveWordIndex(null)
-        }
+        speech.onended = null
         speech.onerror = () => setShortsformTtsStatus('Edge TTS audio could not be played.')
         speech.src = objectUrl
         speech.load()
         await speech.play()
-        setShortsformTtsStatus(`Narrating with ${settings.shortsformTtsVoice}.`)
       })
       .catch((reason) => {
         if (active) {
@@ -643,8 +714,7 @@ function App() {
     if (
       page !== 'shortsform' ||
       !playing ||
-      !currentChunk ||
-      settings.shortsformTts
+      !currentChunk
     ) return
     setShortsformWordIndex(currentChunk.startWordIndex)
     setShortsformActiveWordIndex(currentChunk.startWordIndex)
@@ -659,7 +729,7 @@ function App() {
       clearInterval(timer)
       setShortsformActiveWordIndex(null)
     }
-  }, [currentChunk, currentVisualDelay, page, playing, settings.shortsformTts])
+  }, [currentChunk, currentVisualDelay, page, playing])
 
   useEffect(() => {
     const speech = shortsformAudioRef.current
@@ -671,7 +741,6 @@ function App() {
       settings.shortsformTtsRate,
     )
     speech.playbackRate = playbackRate
-    setShortsformAudioDurationMs(Math.round(rawDurationMs / playbackRate))
   }, [currentVisualDelay, page, settings.shortsformTtsRate])
 
   useEffect(() => {
@@ -716,14 +785,12 @@ function App() {
 
   useEffect(() => {
     if (!playing || !currentChunk || overlay !== 'none') return
-    if (page === 'shortsform' && settings.shortsformTts && shortsformAudioDurationMs <= 0) return
     const activeScheduler = scheduler.current
     const activeAudio = audio.current
-    void activeAudio.start(settings.audioMode, settings.audioVolume, effectiveWpm / settings.chunkSize)
-    const visualDelay = getChunkDelay(currentChunk, effectiveWpm, settings.clarityPauses)
-    const delay = page === 'shortsform' && settings.shortsformTts
-      ? Math.max(visualDelay, shortsformAudioDurationMs)
-      : visualDelay
+    if (settings.audioMode !== 'soft-drums') {
+      void activeAudio.start(settings.audioMode, settings.audioVolume, effectiveWpm / settings.chunkSize)
+    }
+    const delay = getChunkDelay(currentChunk, effectiveWpm, settings.clarityPauses)
     activeScheduler.schedule(delay, () => {
       const next = safeChunkIndex + 1
       if (next >= chunks.length) {
@@ -778,6 +845,7 @@ function App() {
     document,
     effectiveWpm,
     metrics,
+    narrationMode,
     overlay,
     persistPosition,
     playing,
@@ -785,7 +853,6 @@ function App() {
     quietUntil,
     safeChunkIndex,
     settings,
-    shortsformAudioDurationMs,
     stableChunks,
   ])
 
@@ -968,15 +1035,13 @@ function App() {
 
   useEffect(() => {
     const speech = readerNarrationAudioRef.current
+    let fallbackUtterance: SpeechSynthesisUtterance | null = null
     const stopSpeech = () => {
-      if (readerNarrationFrameRef.current !== null) {
-        cancelAnimationFrame(readerNarrationFrameRef.current)
-        readerNarrationFrameRef.current = null
-      }
       if (speech) {
         speech.pause()
         speech.currentTime = 0
         speech.onloadedmetadata = null
+        speech.onplay = null
         speech.onended = null
         speech.onerror = null
         speech.removeAttribute('src')
@@ -986,50 +1051,95 @@ function App() {
         URL.revokeObjectURL(readerNarrationAudioUrlRef.current)
         readerNarrationAudioUrlRef.current = ''
       }
-      setNarratedWordIndex(-1)
+      if (fallbackUtterance) {
+        window.speechSynthesis?.cancel()
+        fallbackUtterance = null
+      }
     }
 
-    if (!narrationMode || !playing || page !== 'reader' || !readerNarrationChunk || !speech) {
+    if (!narrationMode || !playing || (page !== 'reader' && page !== 'focus') || !readerNarrationChunk || !speech) {
       stopSpeech()
       return
     }
 
-    const firstWordIndex = Math.max(readerWordIndexRef.current, readerNarrationChunk.startWordIndex)
-    const firstTokenOffset = Math.max(0, firstWordIndex - readerNarrationChunk.startWordIndex)
     const targetDuration = getChunkDelay(readerNarrationChunk, effectiveWpm, settings.clarityPauses)
     const synthesisRate = toEdgeTtsRate(effectiveWpm)
+    const cast = narrationCast ?? {
+      narratorVoice: settings.shortsformTtsVoice,
+      characters: [],
+    }
+    const assignment = resolveNarrationVoice(readerNarrationChunk.text, cast)
+    const voice = assignment.voiceName
     let active = true
+    let fallbackStarted = false
 
-    void getShortsformTtsAudio(readerNarrationChunk, synthesisRate)
-      .then(async ({ blob, timings }) => {
+    const narrationChunkIndex = findChunkForWord(shortsformChunks, readerNarrationChunk.startWordIndex)
+    const nextChunk = shortsformChunks[narrationChunkIndex + 1]
+    if (nextChunk) {
+      const nextVoice = resolveNarrationVoice(nextChunk.text, cast).voiceName
+      void getShortsformTtsAudio(nextChunk, synthesisRate, nextVoice).catch(() => undefined)
+    }
+
+    const finishPassage = () => {
+      setReaderNarrationStatus(nextChunk ? 'Waiting for the next phrase' : 'Narration complete')
+    }
+
+    const startBrowserNarration = () => {
+      if (!active || fallbackStarted || !('speechSynthesis' in window)) return false
+      fallbackStarted = true
+      const utterance = new SpeechSynthesisUtterance(readerNarrationChunk.text)
+      fallbackUtterance = utterance
+      utterance.rate = Math.min(2, Math.max(0.5, effectiveWpm / 240 * settings.shortsformTtsRate))
+      utterance.pitch = settings.shortsformTtsPitch
+      utterance.lang = voice.slice(0, 5)
+      utterance.onstart = () => setReaderNarrationStatus(`Narrating ${assignment.character} with browser voice`)
+      utterance.onend = finishPassage
+      utterance.onerror = () => {
+        setReaderNarrationStatus('Narration could not start')
+        setError('Narration could not start. Check browser audio permissions.')
+        setPlaying(false)
+      }
+      window.speechSynthesis.cancel()
+      window.speechSynthesis.speak(utterance)
+      return true
+    }
+
+    setReaderNarrationStatus(`Preparing ${assignment.character}…`)
+    void getShortsformTtsAudio(readerNarrationChunk, synthesisRate, voice)
+      .then(async ({ blob }) => {
         if (!active) return
         const objectUrl = URL.createObjectURL(blob)
         readerNarrationAudioUrlRef.current = objectUrl
         speech.onloadedmetadata = () => {
           const rawDurationMs = Number.isFinite(speech.duration) ? speech.duration * 1000 : 0
-          speech.playbackRate = getShortsformAudioPlaybackRate(rawDurationMs, targetDuration)
-          const initialTiming = timings.find((timing) => timing.tokenOffset >= firstTokenOffset)
-          if (initialTiming) speech.currentTime = initialTiming.offsetMs / 1000
+          speech.playbackRate = getShortsformAudioPlaybackRate(
+            rawDurationMs,
+            targetDuration,
+            settings.shortsformTtsRate,
+          )
         }
-        const updateHighlight = () => {
-          if (!active || speech.paused || speech.ended) return
-          const timingIndex = getActiveTtsTimingIndex(timings, speech.currentTime * 1000)
-          const timing = timings[timingIndex]
-          setNarratedWordIndex(timing
-            ? readerNarrationChunk.startWordIndex + timing.tokenOffset
-            : -1)
-          readerNarrationFrameRef.current = requestAnimationFrame(updateHighlight)
+        speech.onplay = () => setReaderNarrationStatus(`Narrating ${assignment.character} with ${voice}`)
+        speech.onended = finishPassage
+        speech.onerror = () => {
+          stopSpeech()
+          if (!startBrowserNarration()) {
+            setReaderNarrationStatus('Narration audio could not be played')
+            setError('Narration audio could not be played.')
+            setPlaying(false)
+          }
         }
-        speech.onended = () => setNarratedWordIndex(-1)
-        speech.onerror = () => setError('Narration audio could not be played.')
         speech.src = objectUrl
         speech.load()
         await speech.play()
-        updateHighlight()
       })
       .catch((reason) => {
         if (!active) return
-        setError(reason instanceof Error ? reason.message : 'Narration failed.')
+        if (!startBrowserNarration()) {
+          const message = reason instanceof Error ? reason.message : 'Narration failed.'
+          setReaderNarrationStatus(message)
+          setError(message)
+          setPlaying(false)
+        }
       })
 
     return () => {
@@ -1039,11 +1149,59 @@ function App() {
   }, [
     effectiveWpm,
     getShortsformTtsAudio,
+    narrationCast,
     narrationMode,
     page,
     playing,
     readerNarrationChunk,
+    shortsformChunks,
     settings.clarityPauses,
+    settings.audioMode,
+    settings.audioVolume,
+    settings.shortsformTtsPitch,
+    settings.shortsformTtsRate,
+    settings.shortsformTtsVoice,
+  ])
+
+  useEffect(() => {
+    if (!playing || !narrationMode || (page !== 'reader' && page !== 'focus')) return
+    const ambientAudio = audio.current
+    void ambientAudio.start(settings.audioMode, settings.audioVolume, effectiveWpm)
+    return () => ambientAudio.stop()
+  }, [
+    effectiveWpm,
+    narrationMode,
+    page,
+    playing,
+    settings.audioMode,
+    settings.audioVolume,
+  ])
+
+  useEffect(() => {
+    if (
+      !playing
+      || narrationMode
+      || settings.audioMode !== 'soft-drums'
+      || !currentChunk
+      || (page !== 'reader' && page !== 'focus')
+    ) return
+    let pulses = 0
+    const pulse = () => {
+      if (pulses >= currentChunk.tokens.length) return
+      pulses += 1
+      void audio.current.pulseWord(settings.audioVolume)
+    }
+    pulse()
+    const timer = window.setInterval(pulse, 60_000 / Math.max(effectiveWpm, 50))
+    return () => clearInterval(timer)
+  }, [
+    currentChunk,
+    effectiveWpm,
+    narrationMode,
+    page,
+    playing,
+    settings.audioMode,
+    settings.audioVolume,
   ])
 
   useEffect(() => {
@@ -1061,7 +1219,7 @@ function App() {
         setFocusMode((value) => !value)
       } else if (matchesHotkey(event, settings.hotkeys.narration)) {
         event.preventDefault()
-        setNarrationMode((value) => !value)
+        toggleNarration()
       } else if (event.code === 'KeyB') pauseForContext('break')
       else if (event.code === 'KeyR') restart()
       else if (matchesHotkey(event, settings.hotkeys.settings)) setSettingsOpen((value) => !value)
@@ -1106,13 +1264,11 @@ function App() {
     if (document) setChunkIndex(findChunkForWord(buildChunks(document, nextSettings.chunkSize, mode), currentWord))
   }
 
-  async function handleImport(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]
-    if (!file) return
+  async function completeImport(importer: () => Promise<ParsedDocument>) {
     setImporting(true)
     setError('')
     try {
-      let parsed = await importDocument(file)
+      let parsed = await importer()
       if (settings.aiSymbolGrouping) {
         try {
           const hints = await analyzeSymbolGrouping(parsed.text.slice(0, 5000), parsed.title)
@@ -1144,10 +1300,20 @@ function App() {
         savedAt: Date.now(),
       })
       setQueue(await getQueue())
+      setImportOpen(false)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Document import failed.')
     } finally {
       setImporting(false)
+    }
+  }
+
+  async function handleImport(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    try {
+      await completeImport(() => importDocument(file))
+    } finally {
       event.target.value = ''
     }
   }
@@ -1254,6 +1420,7 @@ function App() {
         <button className="wordmark" onClick={() => navigateToPage('reader')} type="button">Celere</button>
         <nav aria-label="Pages">
           <button className={page === 'reader' ? 'active' : ''} onClick={() => navigateToPage('reader')} type="button">Reader</button>
+          <button className={page === 'focus' ? 'active' : ''} onClick={() => navigateToPage('focus')} type="button">Word Focus</button>
           <button className={page === 'shortsform' ? 'active' : ''} onClick={() => navigateToPage('shortsform')} type="button">Shortsform</button>
           <button className={page === 'guide' ? 'active' : ''} onClick={() => navigateToPage('guide')} type="button">Guide</button>
         </nav>
@@ -1290,6 +1457,7 @@ function App() {
               <div className="reader-status">
                 <span>{attention}</span>
                 {settings.toneIndicators ? <span>{currentTone.label}</span> : null}
+                {narrationMode ? <span>{readerNarrationStatus}</span> : null}
                 {sprintSeconds > 0 ? <span>{formatTime(sprintSeconds)}</span> : null}
                 <span>{effectiveWpm} WPM</span>
                 {measuredWpm > 0 ? <span>{measuredWpm} actual</span> : null}
@@ -1314,11 +1482,10 @@ function App() {
                 <h1>Read one clear phrase at a time.</h1>
                 <p>Import a document, choose an intent, and adjust every attention aid independently.</p>
                 <ModeSelector mode={settings.mode} onChange={applyMode} />
-                <label className="primary-button">
+                <button className="primary-button" onClick={() => setImportOpen(true)} type="button">
                   <FileUp size={17} />
-                  {importing ? 'Importing…' : 'Upload document'}
-                  <input accept={DOCUMENT_ACCEPT} hidden onChange={handleImport} type="file" />
-                </label>
+                  {importing ? 'Importing…' : 'Add reading'}
+                </button>
                 {error ? <p className="error"><AlertCircle size={16} />{error}</p> : null}
                 {settings.resurfaceQueue && queue.length > 0 ? (
                   <div className="resurface">
@@ -1341,7 +1508,7 @@ function App() {
               >
                 <ChunkView
                   chunk={currentChunk}
-                  narratedWordIndex={narrationMode ? narratedWordIndex : -1}
+                  narrationActive={narrationMode}
                   showFocusPoint={settings.showFocusPoint}
                   showRoles={settings.showRoleHighlights}
                 />
@@ -1398,6 +1565,7 @@ function App() {
             focusMode={focusMode}
             narrationMode={narrationMode}
             onImport={handleImport}
+            onOpenImport={() => setImportOpen(true)}
             onRestart={restart}
             onRewind={smartRewind}
             onToggle={togglePlayback}
@@ -1413,7 +1581,7 @@ function App() {
             onConfused={() => addReaction('confused')}
             onSettings={() => setSettingsOpen((value) => !value)}
             onFocusMode={() => setFocusMode((value) => !value)}
-            onNarration={() => setNarrationMode((value) => !value)}
+            onNarration={toggleNarration}
             onGuide={() => setPage('guide')}
             onShortcuts={() => setShortcutsOpen(true)}
           />
@@ -1421,6 +1589,112 @@ function App() {
           {settingsOpen ? (
             <SettingsPanel
               settings={settings}
+              voices={shortsformVoices}
+              narrationStatus={readerNarrationStatus}
+              narrationCast={narrationCast}
+              runtimeStatus={runtimeStatus}
+              lastVoiceCommand={lastVoiceCommand}
+              onChange={updateSetting}
+              onMode={applyMode}
+              onPreset={(preset) => setSettings((value) => ({ ...value, ...sensoryPresets[preset], sensoryPreset: preset }))}
+              onUploadBackground={handleBackgroundUpload}
+              onBackgroundUrl={applyBackgroundUrl}
+              onRemoveBackground={() => setSettings((value) => ({ ...value, backgroundMediaType: 'none', backgroundMediaUrl: '' }))}
+              onRecalibrate={() => setCalibrationOpen(true)}
+              onRemoveDocument={() => void removeCurrentDocument()}
+            />
+          ) : null}
+        </main>
+      ) : page === 'focus' ? (
+        <main className="reader-page word-focus-page">
+          <Background settings={settings} mediaRef={mediaRef} youtubeRef={youtubeRef} />
+          <div className="media-scrim" style={{ opacity: settings.backgroundDim / 100 }} />
+          <WordFocusDocument
+            activeWordStart={currentChunk?.startWordIndex ?? 0}
+            document={document}
+            importing={importing}
+            onOpenImport={() => setImportOpen(true)}
+            onJump={jumpToFocusWord}
+            settings={settings}
+          />
+
+          <ReaderOverlay
+            overlay={overlay}
+            seconds={overlaySeconds}
+            text={overlayText}
+            quiz={quiz}
+            quizEnabled={settings.aiMicroQuizzes}
+            quizChoice={quizChoice}
+            onQuizChoice={(index) => {
+              setQuizChoice(index)
+              window.setTimeout(() => handleComprehension(index === quiz?.answerIndex), 700)
+            }}
+            onResume={() => { setOverlay('none'); setPlaying(true) }}
+            onRewind={smartRewind}
+            onLockedIn={lockedIn}
+            onUnderstood={() => handleComprehension(true)}
+            onLost={() => handleComprehension(false)}
+            onDisableChecks={() => { updateSetting('quickSenseChecks', false); setOverlay('none'); setPlaying(true) }}
+            onQuiz={() => {
+              if (!overlayText || !document) return
+              void createQuiz(overlayText, settings.mode, document.title)
+                .then(setQuiz)
+                .catch(() => setQuiz(null))
+            }}
+            onRestart={restart}
+            onReview={() => { setOverlay('none'); setNotesOpen(true) }}
+            onSprint={() => { setOverlay('none'); setSprintSeconds(300); setPlaying(true) }}
+            onContinueSprint={() => {
+              const seconds = (settings.sprintMinutes || 5) * 60
+              setSprintSeconds(seconds)
+              setOverlay('none')
+              setPlaying(true)
+            }}
+            onTakeBreak={() => pauseForContext('break')}
+          />
+
+          <Progress
+            progress={progress}
+            document={document}
+            showMilestones={settings.showMilestones}
+            onJump={jumpToFocusWord}
+          />
+
+          <Dock
+            label="Word Focus controls"
+            playing={playing}
+            importing={importing}
+            settingsOpen={settingsOpen}
+            focusMode={focusMode}
+            narrationMode={narrationMode}
+            onImport={handleImport}
+            onOpenImport={() => setImportOpen(true)}
+            onRestart={restart}
+            onRewind={smartRewind}
+            onToggle={togglePlayback}
+            onNext={() => setChunkIndex((value) => Math.min(value + 1, chunks.length - 1))}
+            onBreak={() => pauseForContext('break')}
+            onSprint={() => setSprintSeconds((settings.sprintMinutes || 5) * 60)}
+            onText={() => setTextOpen(true)}
+            onNotes={() => setNotesOpen(true)}
+            onUnderstood={() => handleComprehension(true)}
+            onLosingFocus={losingFocus}
+            onLockedIn={lockedIn}
+            onImportant={() => addReaction('important')}
+            onConfused={() => addReaction('confused')}
+            onSettings={() => setSettingsOpen((value) => !value)}
+            onFocusMode={() => setFocusMode((value) => !value)}
+            onNarration={toggleNarration}
+            onGuide={() => setPage('guide')}
+            onShortcuts={() => setShortcutsOpen(true)}
+          />
+
+          {settingsOpen ? (
+            <SettingsPanel
+              settings={settings}
+              voices={shortsformVoices}
+              narrationStatus={readerNarrationStatus}
+              narrationCast={narrationCast}
               runtimeStatus={runtimeStatus}
               lastVoiceCommand={lastVoiceCommand}
               onChange={updateSetting}
@@ -1442,7 +1716,7 @@ function App() {
           importing={importing}
           onBreak={() => pauseForContext('break')}
           onChange={updateSetting}
-          onImport={handleImport}
+          onOpenImport={() => setImportOpen(true)}
           onPlayPause={togglePlayback}
           onReader={() => navigateToPage('reader')}
           onToggleSettings={() => setSettingsOpen((value) => !value)}
@@ -1458,6 +1732,16 @@ function App() {
       ) : (
         <GuidePage queryStatus={semanticStatus} runtimeStatus={runtimeStatus} />
       )}
+
+      <ImportDialog
+        error={error}
+        importing={importing}
+        onClose={() => setImportOpen(false)}
+        onFile={(file) => completeImport(() => importDocument(file))}
+        onText={(text, title, format) => completeImport(() => importText(text, title, format))}
+        onWebsite={(url) => completeImport(() => importWebsite(url))}
+        open={importOpen}
+      />
 
       <SemanticSearchModal
         open={semanticOpen}
@@ -1560,6 +1844,186 @@ function App() {
   }
 }
 
+type ImportSource = 'file' | 'website' | 'paste' | 'kindle' | 'libby'
+
+function ImportDialog(props: {
+  error: string
+  importing: boolean
+  onClose: () => void
+  onFile: (file: File) => Promise<void>
+  onText: (text: string, title: string, format: 'text' | 'markdown') => Promise<void>
+  onWebsite: (url: string) => Promise<void>
+  open: boolean
+}) {
+  const [source, setSource] = useState<ImportSource>('file')
+  const [url, setUrl] = useState('')
+  const [title, setTitle] = useState('')
+  const [text, setText] = useState('')
+  const [textFormat, setTextFormat] = useState<'text' | 'markdown'>('text')
+
+  useEffect(() => {
+    if (!props.open) return
+    setSource('file')
+    setUrl('')
+    setTitle('')
+    setText('')
+    setTextFormat('text')
+  }, [props.open])
+
+  if (!props.open) return null
+
+  const sourceLabels: Array<[ImportSource, string, ReactNode]> = [
+    ['file', 'File', <FileUp />],
+    ['website', 'Website URL', <Globe2 />],
+    ['paste', 'Paste text', <ClipboardPaste />],
+    ['kindle', 'Kindle Cloud Reader', <BookOpen />],
+    ['libby', 'Libby', <Library />],
+  ]
+  const guidedSource = source === 'kindle' || source === 'libby'
+  const pasteTitle = source === 'kindle'
+    ? 'Kindle excerpt'
+    : source === 'libby'
+      ? 'Libby excerpt'
+      : 'Pasted text'
+
+  async function chooseFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (file) await props.onFile(file)
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !props.importing) props.onClose()
+    }}>
+      <section aria-label="Import reading" aria-modal="true" className="modal import-dialog" role="dialog">
+        <header>
+          <div>
+            <h2>Import reading</h2>
+            <p>Choose a file, public webpage, or text source.</p>
+          </div>
+          <button aria-label="Close import" disabled={props.importing} onClick={props.onClose} type="button"><X /></button>
+        </header>
+
+        <div className="import-layout">
+          <nav aria-label="Import sources" className="import-sources">
+            {sourceLabels.map(([value, label, icon]) => (
+              <button
+                className={source === value ? 'active' : ''}
+                key={value}
+                onClick={() => setSource(value)}
+                type="button"
+              >
+                {icon}
+                <span>{label}</span>
+              </button>
+            ))}
+          </nav>
+
+          <div className="import-panel">
+            {source === 'file' ? (
+              <>
+                <h3>Upload a document</h3>
+                <p>Files are processed locally by Celere and saved in this browser.</p>
+                <div className="import-file-grid">
+                  <label>
+                    <strong>PDF</strong>
+                    <span>Text-based PDF documents</span>
+                    <input accept=".pdf,application/pdf" disabled={props.importing} hidden onChange={chooseFile} type="file" />
+                  </label>
+                  <label>
+                    <strong>EPUB</strong>
+                    <span>DRM-free ebooks and exports</span>
+                    <input accept=".epub,application/epub+zip" disabled={props.importing} hidden onChange={chooseFile} type="file" />
+                  </label>
+                  <label>
+                    <strong>Markdown or text</strong>
+                    <span>MD, Markdown, and TXT</span>
+                    <input accept=".md,.markdown,.txt,text/markdown,text/plain" disabled={props.importing} hidden onChange={chooseFile} type="file" />
+                  </label>
+                  <label>
+                    <strong>Word or HTML</strong>
+                    <span>DOC, DOCX, HTML, and HTM</span>
+                    <input accept=".doc,.docx,.html,.htm" disabled={props.importing} hidden onChange={chooseFile} type="file" />
+                  </label>
+                </div>
+              </>
+            ) : source === 'website' ? (
+              <>
+                <h3>Import a public webpage</h3>
+                <p>Celere extracts readable text from public articles and supported document links.</p>
+                <label className="import-field">
+                  <span>Website URL</span>
+                  <input
+                    aria-label="Website URL"
+                    autoFocus
+                    onChange={(event) => setUrl(event.target.value)}
+                    placeholder="https://example.com/article"
+                    type="url"
+                    value={url}
+                  />
+                </label>
+                <button disabled={props.importing || !url.trim()} onClick={() => void props.onWebsite(url.trim())} type="button">
+                  {props.importing ? 'Importing…' : 'Import website'}
+                </button>
+              </>
+            ) : (
+              <>
+                <h3>{guidedSource ? `Import from ${source === 'kindle' ? 'Kindle Cloud Reader' : 'Libby'}` : 'Paste text or Markdown'}</h3>
+                {source === 'kindle' ? (
+                  <p>Copy text you are permitted to use from Kindle Cloud Reader and paste it below. Celere cannot bypass Kindle DRM or sign in to your Amazon account.</p>
+                ) : source === 'libby' ? (
+                  <p>Paste an excerpt or notes from Libby, or upload a DRM-free PDF or EPUB you are permitted to use. Celere cannot access your library account or protected loans directly.</p>
+                ) : (
+                  <p>Paste plain text or Markdown. Markdown headings become navigable document sections.</p>
+                )}
+                <label className="import-field">
+                  <span>Title</span>
+                  <input aria-label="Title" onChange={(event) => setTitle(event.target.value)} placeholder={pasteTitle} value={title} />
+                </label>
+                <label className="import-field">
+                  <span>Format</span>
+                  <select aria-label="Format" onChange={(event) => setTextFormat(event.target.value as 'text' | 'markdown')} value={textFormat}>
+                    <option value="text">Plain text</option>
+                    <option value="markdown">Markdown</option>
+                  </select>
+                </label>
+                <label className="import-field">
+                  <span>Text</span>
+                  <textarea
+                    aria-label="Text"
+                    autoFocus
+                    onChange={(event) => setText(event.target.value)}
+                    placeholder="Paste readable text here"
+                    rows={10}
+                    value={text}
+                  />
+                </label>
+                <div className="import-actions">
+                  {guidedSource ? (
+                    <label className="secondary-button">
+                      Upload PDF or EPUB
+                      <input accept=".pdf,.epub,application/pdf,application/epub+zip" disabled={props.importing} hidden onChange={chooseFile} type="file" />
+                    </label>
+                  ) : null}
+                  <button
+                    disabled={props.importing || !text.trim()}
+                    onClick={() => void props.onText(text, title || pasteTitle, textFormat)}
+                    type="button"
+                  >
+                    {props.importing ? 'Importing…' : 'Import text'}
+                  </button>
+                </div>
+              </>
+            )}
+            {props.error ? <p className="error"><AlertCircle size={16} />{props.error}</p> : null}
+          </div>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 function ShortsformPage(props: {
   activeWordIndex: number | null
   currentChunk: ReadingChunk | null
@@ -1568,7 +2032,7 @@ function ShortsformPage(props: {
   importing: boolean
   onBreak: () => void
   onChange: <K extends keyof ReaderSettings>(key: K, value: ReaderSettings[K]) => void
-  onImport: (event: ChangeEvent<HTMLInputElement>) => void
+  onOpenImport: () => void
   onPlayPause: () => void
   onReader: () => void
   onToggleSettings: () => void
@@ -1683,10 +2147,9 @@ function ShortsformPage(props: {
             <span>{props.ttsStatus}</span>
           </div>
           <div className="shortsform-toolbar-actions">
-            <label className="shortsform-button">
+            <button className="shortsform-button" onClick={props.onOpenImport} type="button">
               {props.importing ? 'Importing…' : 'Upload file'}
-              <input accept={DOCUMENT_ACCEPT} hidden onChange={props.onImport} type="file" />
-            </label>
+            </button>
             <button className="shortsform-button" onClick={props.onToggleSettings} type="button">
               {props.settingsOpen ? 'Close settings' : 'Settings'}
             </button>
@@ -1833,19 +2296,122 @@ function ShortsformPage(props: {
   )
 }
 
-function ChunkView({ chunk, narratedWordIndex, showFocusPoint, showRoles }: {
+function WordFocusDocument(props: {
+  activeWordStart: number
+  document: ParsedDocument | null
+  importing: boolean
+  onOpenImport: () => void
+  onJump: (wordIndex: number) => void
+  settings: ReaderSettings
+}) {
+  const tokenRefs = useRef(new Map<number, HTMLSpanElement>())
+  const previousWordRef = useRef<number | null>(null)
+  const registerToken = useCallback((wordIndex: number, node: HTMLSpanElement | null) => {
+    if (node) tokenRefs.current.set(wordIndex, node)
+    else tokenRefs.current.delete(wordIndex)
+  }, [])
+
+  useLayoutEffect(() => {
+    const previousToken = previousWordRef.current === null
+      ? null
+      : tokenRefs.current.get(previousWordRef.current)
+    const activeToken = tokenRefs.current.get(props.activeWordStart)
+
+    previousToken?.classList.remove('active')
+    previousToken?.removeAttribute('aria-current')
+    previousToken?.closest('p')?.classList.remove('active-paragraph')
+
+    activeToken?.classList.add('active')
+    activeToken?.setAttribute('aria-current', 'true')
+    activeToken?.closest('p')?.classList.add('active-paragraph')
+    previousWordRef.current = props.activeWordStart
+
+    const scroller = activeToken?.closest<HTMLElement>('.word-focus-scroll')
+    if (!activeToken || !scroller) return
+    const tokenRect = activeToken.getBoundingClientRect()
+    const scrollerRect = scroller.getBoundingClientRect()
+    const upperBound = scrollerRect.top + scrollerRect.height * 0.3
+    const lowerBound = scrollerRect.top + scrollerRect.height * 0.7
+    if (tokenRect.top >= upperBound && tokenRect.bottom <= lowerBound) return
+
+    scroller.scrollTop += tokenRect.top
+      - scrollerRect.top
+      - scrollerRect.height / 2
+      + tokenRect.height / 2
+  }, [props.activeWordStart, props.document, props.settings.showRoleHighlights])
+
+  if (!props.document) {
+    return (
+      <section className="word-focus-empty">
+          <p>Word Focus highlights one active word while narration reads natural phrases.</p>
+          <button onClick={props.onOpenImport} type="button">
+            <FileUp size={18} />
+            {props.importing ? 'Importing…' : 'Upload document'}
+          </button>
+      </section>
+    )
+  }
+
+  return (
+    <div className="word-focus-scroll">
+      <WordFocusContent
+        document={props.document}
+        onJump={props.onJump}
+        registerToken={registerToken}
+        showRoleHighlights={props.settings.showRoleHighlights}
+      />
+    </div>
+  )
+}
+
+const WordFocusContent = memo(function WordFocusContent(props: {
+  document: ParsedDocument
+  onJump: (wordIndex: number) => void
+  registerToken: (wordIndex: number, node: HTMLSpanElement | null) => void
+  showRoleHighlights: boolean
+}) {
+  return (
+    <article className="word-focus-document" aria-label={props.document.title}>
+      {props.document.sections.map((section) => (
+        <section key={section.id}>
+          {section.title && !/^Section \d+$/i.test(section.title) ? <h2>{section.title}</h2> : null}
+          {section.paragraphs.map((paragraph) => (
+            <p key={paragraph.id}>
+              {props.document.tokens.slice(paragraph.tokenStart, paragraph.tokenEnd + 1).map((token, index, tokens) => (
+                <span key={token.id}>
+                  <span
+                    className={[
+                      'word-focus-token',
+                      props.showRoleHighlights ? `role-${token.role}` : '',
+                    ].filter(Boolean).join(' ')}
+                    onClick={() => props.onJump(token.source.wordIndex)}
+                    ref={(node) => props.registerToken(token.source.wordIndex, node)}
+                  >
+                    {token.text}
+                  </span>
+                  {shouldSpace(token, tokens[index + 1]) ? ' ' : ''}
+                </span>
+              ))}
+            </p>
+          ))}
+        </section>
+      ))}
+    </article>
+  )
+})
+
+function ChunkView({ chunk, narrationActive, showFocusPoint, showRoles }: {
   chunk: ReadingChunk | null
-  narratedWordIndex: number
+  narrationActive: boolean
   showFocusPoint: boolean
   showRoles: boolean
 }) {
   if (!chunk) return null
   return (
-    <div className="display-line">
+    <div className={`display-line${narrationActive ? ' narration-active' : ''}`}>
       {chunk.tokens.map((token, index) => (
         <span className={[
           showRoles ? `role-${token.role}` : '',
-          token.source.wordIndex === narratedWordIndex ? 'narrated-token' : '',
         ].filter(Boolean).join(' ')} key={token.id}>
           <FocusableToken token={token} enabled={showFocusPoint} />
           {shouldSpace(token, chunk.tokens[index + 1]) ? ' ' : ''}
@@ -1931,12 +2497,14 @@ function Progress({ progress, document, showMilestones, onJump }: {
 }
 
 function Dock(props: {
+  label?: string
   playing: boolean
   importing: boolean
   settingsOpen: boolean
   focusMode: boolean
   narrationMode: boolean
   onImport: (event: ChangeEvent<HTMLInputElement>) => void
+  onOpenImport: () => void
   onRestart: () => void
   onRewind: () => void
   onToggle: () => void
@@ -1977,12 +2545,12 @@ function Dock(props: {
     ['Shortcuts', <CircleHelp />, props.onShortcuts],
   ]
   return (
-    <div className="dock" role="toolbar" aria-label="Reader controls">
-      <label className="dock-action">
+    <div className="dock" role="toolbar" aria-label={props.label ?? 'Reader controls'}>
+      <button className="dock-action" onClick={props.onOpenImport} title="Import" type="button">
         <FileUp />
-        <span>{props.importing ? 'Importing' : 'Upload'}</span>
-        <input accept={DOCUMENT_ACCEPT} hidden onChange={props.onImport} type="file" />
-      </label>
+        <span>{props.importing ? 'Importing' : 'Import'}</span>
+      </button>
+      <input accept={DOCUMENT_ACCEPT} aria-label="Upload" className="visually-hidden" onChange={props.onImport} type="file" />
       {actions.map(([label, icon, action, primary]) => (
         <button className={`dock-action ${primary ? 'primary' : ''}`} key={label} onClick={action} title={label} type="button">
           {icon}
@@ -1995,6 +2563,9 @@ function Dock(props: {
 
 function SettingsPanel(props: {
   settings: ReaderSettings
+  voices: ShortsformVoice[]
+  narrationStatus: string
+  narrationCast: NarrationCast | null
   runtimeStatus: { voice: string; eye: string }
   lastVoiceCommand: string
   onChange: <K extends keyof ReaderSettings>(key: K, value: ReaderSettings[K]) => void
@@ -2059,7 +2630,7 @@ function SettingsPanel(props: {
       </section>
       <section>
         <h2>Appearance</h2>
-        <Select label="Theme" value={s.theme} options={['light', 'paper', 'dark', 'eink', 'high-contrast']} onChange={(value) => props.onChange('theme', value as ReaderSettings['theme'])} />
+        <Select label="Theme" value={s.theme} options={['light', 'paper', 'sepia', 'dark', 'eink', 'high-contrast']} onChange={(value) => props.onChange('theme', value as ReaderSettings['theme'])} />
         <Select label="Contrast" value={s.contrast} options={['soft', 'balanced', 'high']} onChange={(value) => props.onChange('contrast', value as ReaderSettings['contrast'])} />
         <Select label="Eye anchor style" value={s.eyeAnchorStyle} options={['line', 'grid']} onChange={(value) => props.onChange('eyeAnchorStyle', value as ReaderSettings['eyeAnchorStyle'])} />
         <Select label="Sensory preset" value={s.sensoryPreset} options={['neutral', 'calm', 'crisp', 'low-stim']} onChange={(value) => props.onPreset(value as ReaderSettings['sensoryPreset'])} />
@@ -2090,7 +2661,16 @@ function SettingsPanel(props: {
       </section>
       <section>
         <h2>Audio</h2>
-        <Select label="Ambient audio" value={s.audioMode} options={['off', 'brown-noise', 'binaural-beats', 'metronome']} onChange={(value) => props.onChange('audioMode', value as ReaderSettings['audioMode'])} />
+        <p className="settings-status" role="status">Narration: {props.narrationStatus}</p>
+        <p className="settings-status">
+          Character voices: {props.narrationCast?.characters.length
+            ? props.narrationCast.characters.map((character) => character.name).join(', ')
+            : 'Narrator only'}
+        </p>
+        <Select label="Narration voice" value={s.shortsformTtsVoice} options={props.voices.map((voice) => voice.name)} onChange={(value) => props.onChange('shortsformTtsVoice', value)} />
+        <Range label={`Narration pace · ${s.shortsformTtsRate.toFixed(1)}×`} min={0.5} max={2} step={0.1} value={s.shortsformTtsRate} onChange={(value) => props.onChange('shortsformTtsRate', value)} />
+        <Range label={`Narration pitch · ${s.shortsformTtsPitch.toFixed(1)}×`} min={0.5} max={1.5} step={0.1} value={s.shortsformTtsPitch} onChange={(value) => props.onChange('shortsformTtsPitch', value)} />
+        <Select label="Ambient audio" value={s.audioMode} options={['off', 'soft-drums', 'brown-noise', 'binaural-beats', 'metronome']} onChange={(value) => props.onChange('audioMode', value as ReaderSettings['audioMode'])} />
         <Range label={`Volume · ${s.audioVolume}%`} min={0} max={100} value={s.audioVolume} onChange={(value) => props.onChange('audioVolume', value)} />
       </section>
       <section>
@@ -2443,11 +3023,12 @@ function matchesHotkey(event: globalThis.KeyboardEvent, binding: string) {
 }
 
 function getThemeStyle(settings: ReaderSettings): Record<string, string> {
-  if (settings.theme === 'high-contrast') return { '--bg': '#000000', '--surface': '#000000', '--text': '#ffffff', '--muted': '#ffffff', '--line': '#ffffff', '--accent': '#00e5ff', '--accent-soft': '#101010', '--focus-red': '#ff5a4f', '--anchor-line': 'rgba(255, 255, 255, 0.42)' }
-  if (settings.theme === 'dark') return { '--bg': '#091717', '--surface': '#13343b', '--text': '#fbfaf4', '--muted': '#b7c3c1', '--line': '#36555b', '--accent': '#1fb8cd', '--accent-soft': '#204b52' }
-  if (settings.theme === 'eink') return { '--bg': '#e9e7df', '--surface': '#f4f2ea', '--text': '#181a19', '--muted': '#606562', '--line': '#b7bbb6', '--accent': '#2e565e', '--accent-soft': '#d9e6e4' }
-  if (settings.theme === 'light') return { '--bg': '#ffffff', '--surface': '#ffffff', '--text': '#091717', '--muted': '#526462', '--line': '#d8dedb', '--accent': '#168da0', '--accent-soft': '#e6f8fa' }
-  return { '--bg': settings.backgroundColor, '--surface': '#fffef9', '--text': settings.textColor, '--muted': '#526462', '--line': '#cad2ce', '--accent': '#1fb8cd', '--accent-soft': '#def7f9' }
+  if (settings.theme === 'high-contrast') return { '--bg': '#000000', '--surface': '#000000', '--text': '#ffffff', '--muted': '#ffffff', '--line': '#ffffff', '--accent': '#00e5ff', '--accent-soft': '#101010', '--focus-red': '#ff5a4f', '--anchor-line': 'rgba(255, 255, 255, 0.42)', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
+  if (settings.theme === 'dark') return { '--bg': '#091717', '--surface': '#13343b', '--text': '#fbfaf4', '--muted': '#b7c3c1', '--line': '#36555b', '--accent': '#1fb8cd', '--accent-soft': '#204b52', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
+  if (settings.theme === 'eink') return { '--bg': '#e9e7df', '--surface': '#f4f2ea', '--text': '#181a19', '--muted': '#606562', '--line': '#b7bbb6', '--accent': '#2e565e', '--accent-soft': '#d9e6e4', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
+  if (settings.theme === 'sepia') return { '--bg': '#e8e0c0', '--surface': '#ede4cf', '--text': '#4b3426', '--muted': '#725b47', '--line': '#c8b98d', '--accent': '#6f543c', '--accent-soft': '#d8c99e', '--focus-red': '#4b3426', '--focus-document-font': 'Georgia, serif' }
+  if (settings.theme === 'light') return { '--bg': '#ffffff', '--surface': '#ffffff', '--text': '#091717', '--muted': '#526462', '--line': '#d8dedb', '--accent': '#168da0', '--accent-soft': '#e6f8fa', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
+  return { '--bg': settings.backgroundColor, '--surface': '#fffef9', '--text': settings.textColor, '--muted': '#526462', '--line': '#cad2ce', '--accent': '#1fb8cd', '--accent-soft': '#def7f9', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
 }
 
 function getTone(text: string) {
