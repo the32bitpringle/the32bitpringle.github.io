@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Celere Web Clipper",
+  "description": "Extract readable text from the current page and send it to the Celere web app.",
+  "version": "0.1.0",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Send to Celere"
+  },
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "options_page": "options.html",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}

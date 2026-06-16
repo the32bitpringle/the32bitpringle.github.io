@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Celere Web Clipper</title>
+    <link rel="stylesheet" href="src/popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <span class="mark">C</span>
+        <div>
+          <h1>Celere</h1>
+          <p>Send this page into the reader.</p>
+        </div>
+      </header>
+
+      <section class="actions" aria-label="Clip actions">
+        <button id="send-page" type="button">
+          <span>Send readable page</span>
+          <small>Article, main content, or best text block</small>
+        </button>
+        <button id="send-selection" type="button">
+          <span>Send selection</span>
+          <small>Use highlighted text only</small>
+        </button>
+      </section>
+
+      <p id="status" role="status">Ready</p>
+      <a href="options.html" target="_blank" rel="noreferrer">Extension settings</a>
+    </main>
+    <script src="src/popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,119 @@
+:root {
+  color-scheme: light dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #12211c;
+  background: #f6f3eb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 320px;
+  margin: 0;
+  background: #f6f3eb;
+}
+
+main {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+}
+
+header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+h1,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 18px;
+  letter-spacing: 0;
+}
+
+p,
+small,
+a,
+.field span {
+  color: #5e6e67;
+  font-size: 12px;
+}
+
+a {
+  justify-self: start;
+  text-decoration: none;
+}
+
+.mark {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 10px;
+  background: #14231e;
+  color: #f8f5ed;
+  font-weight: 700;
+}
+
+.actions {
+  display: grid;
+  gap: 8px;
+}
+
+button {
+  width: 100%;
+  border: 1px solid #d9ded6;
+  border-radius: 10px;
+  background: #fffdf7;
+  color: #12211c;
+  cursor: pointer;
+  font: inherit;
+  padding: 11px 12px;
+  text-align: left;
+}
+
+button:hover {
+  border-color: #8da79d;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+button span {
+  display: block;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+button small {
+  display: block;
+  margin-top: 4px;
+}
+
+.field {
+  display: grid;
+  gap: 7px;
+}
+
+input {
+  width: 100%;
+  border: 1px solid #d9ded6;
+  border-radius: 8px;
+  background: #fffdf7;
+  color: #12211c;
+  font: inherit;
+  padding: 10px;
+}
+
+#status {
+  min-height: 16px;
+  color: #274a3d;
+}
