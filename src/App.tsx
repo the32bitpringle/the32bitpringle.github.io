@@ -37,6 +37,7 @@ import {
   useState,
 } from 'react'
 import { featureRegistry } from './config/features'
+import { apiUrl } from './lib/api'
 import {
   analyzeNarrationCast,
   analyzeSymbolGrouping,
@@ -548,7 +549,7 @@ function App({ authControls }: AppProps = {}) {
 
   useEffect(() => {
     let active = true
-    void fetch('/api/tts/voices')
+    void fetch(apiUrl('/api/tts/voices'))
       .then(async (response) => {
         const body = await response.json().catch(() => null)
         if (!response.ok) throw new Error(body?.error ?? 'Edge TTS voices are unavailable.')
@@ -614,7 +615,7 @@ function App({ authControls }: AppProps = {}) {
     const cached = shortsformTtsCacheRef.current.get(key)
     if (cached) return cached
 
-    const request = fetch('/api/tts', {
+    const request = fetch(apiUrl('/api/tts'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2240,7 +2241,7 @@ function ShortsformPage(props: {
     setPreparingFootage(true)
     setStatus('Caching a compact 360p, 10-minute background clip without audio…')
     try {
-      const response = await fetch('/api/shortsform/footage', {
+      const response = await fetch(apiUrl('/api/shortsform/footage'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -2274,7 +2275,7 @@ function ShortsformPage(props: {
       const form = new FormData()
       form.append('file', file)
       form.append('rightsConfirmed', 'true')
-      const response = await fetch('/api/shortsform/footage/upload', {
+      const response = await fetch(apiUrl('/api/shortsform/footage/upload'), {
         method: 'POST',
         body: form,
       })

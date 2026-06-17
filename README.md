@@ -16,6 +16,8 @@ Set `VITE_CLERK_PUBLISHABLE_KEY` in `.env.local` to enable Clerk authentication.
 
 Set `OPENROUTER_API_KEY` in `.env.local` to enable optional Gemma features. The key is never exposed to the client. Semantic retrieval, exact search, RSVP reading, local summaries, and all core controls work without OpenRouter.
 
+Set `VITE_API_BASE_URL` when the static frontend should call a separately hosted Celere API, such as a Railway service. Leave it empty for local same-origin development.
+
 ## Privacy
 
 - Documents, reading progress, notes, settings, and normalized 384-dimensional vectors are stored in IndexedDB.

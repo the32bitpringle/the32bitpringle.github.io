@@ -5,9 +5,10 @@ import type {
   SemanticSearchResult,
   SymbolGroupingHints,
 } from '../types'
+import { apiUrl } from './api'
 
-async function postJson<T>(path: string, body: unknown, signal?: AbortSignal) {
-  const response = await fetch(path, {
+async function postJson<T>(path: `/api/${string}`, body: unknown, signal?: AbortSignal) {
+  const response = await fetch(apiUrl(path), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

@@ -1,4 +1,5 @@
 import type { ParsedDocument } from '../types'
+import { apiUrl } from './api'
 import { createParsedDocument, type ExtractedDocument } from './tokenize'
 
 export const DOCUMENT_ACCEPT = '.pdf,.epub,.md,.markdown,.doc,.docx,.txt,.html,.htm'
@@ -9,7 +10,7 @@ export async function importDocument(file: File): Promise<ParsedDocument> {
 
   const payload = new FormData()
   payload.append('file', file)
-  const response = await fetch('/api/extract', { method: 'POST', body: payload })
+  const response = await fetch(apiUrl('/api/extract'), { method: 'POST', body: payload })
   const body = (await response.json().catch(() => null)) as (ExtractedDocument & { error?: string }) | null
   if (!response.ok || !body) throw new Error(body?.error ?? serverExtractionMessage())
   const parsed = await createParsedDocument(body, file.name)
@@ -38,7 +39,7 @@ export async function importText(
 }
 
 export async function importWebsite(url: string): Promise<ParsedDocument> {
-  const response = await fetch('/api/extract-url', {
+  const response = await fetch(apiUrl('/api/extract-url'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url }),
