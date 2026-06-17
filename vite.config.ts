@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig(({ command }) => ({
   plugins: [react()],
-  base: command === 'serve' ? '/' : '/celere-2/',
+  base: command === 'serve' ? '/' : (process.env.VITE_BASE_PATH ?? '/celere-2/'),
   server: {
     proxy: {
       '/api': 'http://localhost:8787',

@@ -6,3 +6,4 @@ playwright-report/
 .env.local
 *.tsbuildinfo
 .vercel
+.firebase/
