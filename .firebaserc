@@ -1,5 +1,15 @@
 {
   "projects": {
     "default": "celere-2-260616202321"
-  }
+  },
+  "targets": {
+    "celere-2-260616202321": {
+      "hosting": {
+        "reader": [
+          "celere-reader"
+        ]
+      }
+    }
+  },
+  "etags": {}
 }

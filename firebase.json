@@ -1,5 +1,6 @@
 {
   "hosting": {
+    "target": "reader",
     "public": "dist",
     "predeploy": [
       "npm run build:firebase"
