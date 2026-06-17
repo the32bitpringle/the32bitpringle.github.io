@@ -12,10 +12,12 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
+    "verify:production": "npm run build && npm test && playwright test tests/e2e/production.spec.ts",
     "preview": "vite preview",
     "start": "node server/index.mjs"
   },
   "dependencies": {
+    "@clerk/react": "^6.10.0",
     "@fontsource/atkinson-hyperlegible": "^5.2.8",
     "@fontsource/instrument-serif": "^5.2.8",
     "@fontsource/jetbrains-mono": "^5.2.8",

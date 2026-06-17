@@ -3,7 +3,6 @@ import {
   ArrowLeft,
   ArrowRight,
   BookOpen,
-  Brain,
   ClipboardPaste,
   CircleHelp,
   CirclePause,
@@ -47,7 +46,7 @@ import {
   summarizeContext,
 } from './lib/ai'
 import { AmbientAudio } from './lib/audio'
-import { DOCUMENT_ACCEPT, importDocument, importText, importWebsite } from './lib/documents'
+import { importDocument, importText, importWebsite } from './lib/documents'
 import {
   buildFallbackNarrationCast,
   resolveNarrationVoice,
@@ -59,11 +58,12 @@ import {
   alignTtsTimings,
   base64ToAudioBlob,
   getShortsformAudioPlaybackRate,
+  getTtsTimingIndex,
   type AlignedTtsWordTiming,
   type TtsWordTiming,
 } from './lib/shortsform'
 import { isGazePresent } from './lib/gaze'
-import { modePresets, sensoryPresets } from './lib/settings'
+import { DEFAULT_READER_COLORS, modePresets, sensoryPresets } from './lib/settings'
 import {
   deleteDocumentData,
   getDocument,
@@ -82,6 +82,7 @@ import {
   findMeaningfulRewind,
   getChunkDelay,
   getFocusPointIndex,
+  getReadingDelays,
   applyDifficultWords,
   regroupDocument,
   tokensToText,
@@ -100,6 +101,7 @@ import type {
   SemanticSearchResult,
   SessionMetrics,
   ShortsformCaptionAlign,
+  ShortsformCaptionPosition,
   ShortsformSubtitleCase,
   ShortsformSubtitleStyle,
   Token,
@@ -116,6 +118,10 @@ const EMPTY_METRICS: SessionMetrics = {
 
 const STREAK_KEY = 'celere:v2:streak'
 const FOCUS_UI_IDLE_MS = 3000
+const WORD_FOCUS_WINDOW_SIZE = 960
+const WORD_FOCUS_WINDOW_STEP = 160
+const TEXT_VIEW_WINDOW_SIZE = 900
+const TEXT_VIEW_CONTEXT_WORDS = 80
 
 interface StreakState {
   count: number
@@ -131,6 +137,7 @@ interface ShortsformVoice {
 
 interface ShortsformFootage {
   assetId: string
+  kind?: 'local' | 'youtube'
   previewUrl: string
   title: string
 }
@@ -171,7 +178,11 @@ type Overlay =
   | 'sprint'
   | 'restart'
 
-function App() {
+interface AppProps {
+  authControls?: ReactNode
+}
+
+function App({ authControls }: AppProps = {}) {
   const [page, setPage] = useState<AppPage>('reader')
   const [settings, setSettings] = useState<ReaderSettings>(loadSettings)
   const [document, setDocument] = useState<ParsedDocument | null>(null)
@@ -220,8 +231,12 @@ function App() {
   const [shortsformTtsStatus, setShortsformTtsStatus] = useState('Loading Edge TTS voices…')
   const [shortsformWordIndex, setShortsformWordIndex] = useState(0)
   const [shortsformActiveWordIndex, setShortsformActiveWordIndex] = useState<number | null>(null)
+  const [shortsformAudioTimingActive, setShortsformAudioTimingActive] = useState(false)
+  const [sessionWordsRead, setSessionWordsRead] = useState(0)
+  const [sessionReadingMs, setSessionReadingMs] = useState(0)
 
   const scheduler = useRef(new PlaybackScheduler())
+  const playbackDeadlineRef = useRef<number | null>(null)
   const audio = useRef(new AmbientAudio())
   const indexAbort = useRef<AbortController | null>(null)
   const mediaRef = useRef<HTMLVideoElement>(null)
@@ -237,8 +252,12 @@ function App() {
   const readerWordIndexRef = useRef(0)
   const shortsformAudioRef = useRef<HTMLAudioElement | null>(null)
   const shortsformAudioUrlRef = useRef('')
+  const shortsformAudioWatchdogRef = useRef<number | null>(null)
+  const shortsformTimingFrameRef = useRef<number | null>(null)
+  const shortsformTimedWordRef = useRef<number | null>(null)
   const readerNarrationAudioRef = useRef<HTMLAudioElement | null>(null)
   const readerNarrationAudioUrlRef = useRef('')
+  const wordFocusHighlightRef = useRef<(wordIndex: number) => void>(() => {})
   const narrationCastDocumentRef = useRef('')
   const shortsformTtsCacheRef = useRef(new Map<string, Promise<ShortsformTtsAudio>>())
   const shortsformRawAudioDurationRef = useRef(0)
@@ -274,13 +293,24 @@ function App() {
   const effectiveWpm = page === 'shortsform'
     ? settings.shortsformWpm
     : Math.max(50, Math.round((settings.wpm + adaptiveOffset) * ramp))
-  const currentVisualDelay = currentChunk
-    ? getChunkDelay(currentChunk, effectiveWpm, settings.clarityPauses)
-    : 0
+  const pauseDurations = useMemo(() => ({
+    commaMs: settings.pauseCommaMs,
+    periodMs: settings.pausePeriodMs,
+    longWordMs: settings.pauseLongWordMs,
+  }), [settings.pauseCommaMs, settings.pausePeriodMs, settings.pauseLongWordMs])
+  const readingDelays = useMemo(
+    () => getReadingDelays(chunks, effectiveWpm, settings.clarityPauses, pauseDurations),
+    [chunks, effectiveWpm, pauseDurations, settings.clarityPauses],
+  )
+  const narrationDelays = useMemo(
+    () => getReadingDelays(shortsformChunks, effectiveWpm, settings.clarityPauses, pauseDurations),
+    [effectiveWpm, pauseDurations, settings.clarityPauses, shortsformChunks],
+  )
+  const currentVisualDelay = readingDelays[safeChunkIndex] ?? 0
   shortsformTargetDurationRef.current = currentVisualDelay
   shortsformTtsRateRef.current = settings.shortsformTtsRate
-  const measuredWpm = metrics.focusedSeconds > 4 && currentChunk
-    ? Math.round((currentChunk.endWordIndex + 1) / metrics.focusedSeconds * 60)
+  const measuredWpm = sessionReadingMs > 4_000
+    ? Math.round(sessionWordsRead / sessionReadingMs * 60_000)
     : 0
   const minutesLeft = document
     ? Math.max(1, Math.ceil((document.tokens.length - (currentChunk?.startWordIndex ?? 0)) / effectiveWpm))
@@ -332,6 +362,10 @@ function App() {
     setPage(nextPage)
   }, [currentChunk?.startWordIndex, focusChunks, readerChunks, shortsformChunks])
 
+  const registerWordFocusHighlighter = useCallback((highlight: (wordIndex: number) => void) => {
+    wordFocusHighlightRef.current = highlight
+  }, [])
+
   const jumpToFocusWord = useCallback((wordIndex: number) => {
     setChunkIndex(findChunkForWord(focusChunks, wordIndex))
   }, [focusChunks])
@@ -361,6 +395,8 @@ function App() {
     ])
     setQueue(await getQueue())
   }, [chunks, document, metrics, reactions, safeChunkIndex, settings.mode])
+  const persistPositionRef = useRef(persistPosition)
+  persistPositionRef.current = persistPosition
 
   const pauseForContext = useCallback((kind: 'break' | 'hold' | 'drift') => {
     if (!currentChunk) return
@@ -635,6 +671,16 @@ function App() {
   useEffect(() => {
     const speech = shortsformAudioRef.current
     const stopSpeech = () => {
+      if (shortsformAudioWatchdogRef.current !== null) {
+        clearTimeout(shortsformAudioWatchdogRef.current)
+        shortsformAudioWatchdogRef.current = null
+      }
+      if (shortsformTimingFrameRef.current !== null) {
+        cancelAnimationFrame(shortsformTimingFrameRef.current)
+        shortsformTimingFrameRef.current = null
+      }
+      shortsformTimedWordRef.current = null
+      setShortsformAudioTimingActive(false)
       if (speech) {
         speech.pause()
         speech.currentTime = 0
@@ -667,8 +713,30 @@ function App() {
 
     setShortsformTtsStatus('Preparing narration…')
     let active = true
+    const advanceChunk = () => {
+      if (!active) return
+      if (shortsformAudioWatchdogRef.current !== null) {
+        clearTimeout(shortsformAudioWatchdogRef.current)
+        shortsformAudioWatchdogRef.current = null
+      }
+      if (shortsformTimingFrameRef.current !== null) {
+        cancelAnimationFrame(shortsformTimingFrameRef.current)
+        shortsformTimingFrameRef.current = null
+      }
+      setShortsformAudioTimingActive(false)
+      setShortsformTtsStatus('Preparing the next narration phrase…')
+      const next = safeChunkIndex + 1
+      if (next >= chunks.length) {
+        setPlaying(false)
+        setOverlay('complete')
+        return
+      }
+      playbackDeadlineRef.current = null
+      scheduler.current.cancel()
+      setChunkIndex((value) => value === safeChunkIndex ? next : value)
+    }
     void getShortsformTtsAudio(currentChunk)
-      .then(async ({ blob }) => {
+      .then(async ({ blob, timings }) => {
         if (!active) return
         const objectUrl = URL.createObjectURL(blob)
         shortsformAudioUrlRef.current = objectUrl
@@ -684,9 +752,35 @@ function App() {
         }
         speech.onplay = () => {
           setShortsformTtsStatus(`Narrating with ${settings.shortsformTtsVoice}.`)
+          scheduler.current.cancel()
+          playbackDeadlineRef.current = null
+          shortsformAudioWatchdogRef.current = window.setTimeout(
+            advanceChunk,
+            Math.max(currentVisualDelay * 1.5, currentVisualDelay + 3000),
+          )
+          if (!timings.length) return
+          setShortsformAudioTimingActive(true)
+          const updateTimedWord = () => {
+            if (!active || speech.paused || speech.ended) return
+            const timingIndex = getTtsTimingIndex(timings, speech.currentTime * 1000)
+            const timing = timings[timingIndex]
+            if (timing) {
+              const wordIndex = currentChunk.startWordIndex + timing.tokenOffset
+              if (shortsformTimedWordRef.current !== wordIndex) {
+                shortsformTimedWordRef.current = wordIndex
+                setShortsformWordIndex(wordIndex)
+                setShortsformActiveWordIndex(wordIndex)
+              }
+            }
+            shortsformTimingFrameRef.current = requestAnimationFrame(updateTimedWord)
+          }
+          shortsformTimingFrameRef.current = requestAnimationFrame(updateTimedWord)
         }
-        speech.onended = null
-        speech.onerror = () => setShortsformTtsStatus('Edge TTS audio could not be played.')
+        speech.onended = advanceChunk
+        speech.onerror = () => {
+          setShortsformAudioTimingActive(false)
+          setShortsformTtsStatus('Edge TTS audio could not be played. Visual timing is continuing.')
+        }
         speech.src = objectUrl
         speech.load()
         await speech.play()
@@ -703,9 +797,12 @@ function App() {
     }
   }, [
     currentChunk,
+    chunks.length,
+    currentVisualDelay,
     getShortsformTtsAudio,
     page,
     playing,
+    safeChunkIndex,
     settings.shortsformTts,
     settings.shortsformTtsVoice,
   ])
@@ -714,7 +811,8 @@ function App() {
     if (
       page !== 'shortsform' ||
       !playing ||
-      !currentChunk
+      !currentChunk ||
+      (settings.shortsformTts && shortsformAudioTimingActive)
     ) return
     setShortsformWordIndex(currentChunk.startWordIndex)
     setShortsformActiveWordIndex(currentChunk.startWordIndex)
@@ -727,9 +825,15 @@ function App() {
     }, currentVisualDelay / Math.max(currentChunk.tokens.length, 1))
     return () => {
       clearInterval(timer)
-      setShortsformActiveWordIndex(null)
     }
-  }, [currentChunk, currentVisualDelay, page, playing])
+  }, [
+    currentChunk,
+    currentVisualDelay,
+    page,
+    playing,
+    settings.shortsformTts,
+    shortsformAudioTimingActive,
+  ])
 
   useEffect(() => {
     const speech = shortsformAudioRef.current
@@ -784,31 +888,47 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (!playing || !currentChunk || overlay !== 'none') return
+    playbackDeadlineRef.current = null
+    scheduler.current.cancel()
+  }, [readingDelays])
+
+  useEffect(() => {
+    if (!playing || !currentChunk || overlay !== 'none' || narrationMode) {
+      playbackDeadlineRef.current = null
+      return
+    }
     const activeScheduler = scheduler.current
     const activeAudio = audio.current
     if (settings.audioMode !== 'soft-drums') {
       void activeAudio.start(settings.audioMode, settings.audioVolume, effectiveWpm / settings.chunkSize)
     }
-    const delay = getChunkDelay(currentChunk, effectiveWpm, settings.clarityPauses)
-    activeScheduler.schedule(delay, () => {
+    const delay = readingDelays[safeChunkIndex] ?? 0
+    const now = performance.now()
+    const deadline = playbackDeadlineRef.current ?? now + delay
+    playbackDeadlineRef.current = deadline
+    activeScheduler.schedule(Math.max(0, deadline - now), () => {
       const next = safeChunkIndex + 1
       if (next >= chunks.length) {
+        playbackDeadlineRef.current = null
         setPlaying(false)
         activeAudio.stop()
         setOverlay('complete')
         return
       }
+      playbackDeadlineRef.current = deadline + (readingDelays[next] ?? 0)
       const nextFocused = metrics.focusedSeconds + delay / 1000
       const fatigue = getFatigueScore(currentChunk, chunksSinceBreakRef.current, nextFocused, metrics)
       setChunkIndex(next)
       setStableChunks((value) => value + 1)
+      setSessionWordsRead((value) => value + currentChunk.tokens.length)
+      setSessionReadingMs((value) => value + delay)
       setMetrics((value) => ({ ...value, focusedSeconds: nextFocused }))
       chunksSinceBreakRef.current += 1
       if (settings.adaptivePacing && (stableChunks + 1) % 10 === 0) {
         setAdaptiveOffset((value) => Math.min(value + 10, settings.profile.preferredWpmMax - settings.wpm))
       }
       if (
+        page !== 'shortsform' &&
         settings.quickSenseChecks &&
         next > quietUntil &&
         ((settings.mode === 'study' && (stableChunks + 1) % 10 === 0) || fatigue >= 12)
@@ -823,6 +943,7 @@ function App() {
             .catch(() => setQuiz(null))
         }
       } else if (
+        page !== 'shortsform' &&
         settings.microBreaks &&
         next > quietUntil &&
         (chunksSinceBreakRef.current >= settings.microBreakInterval || fatigue >= 14)
@@ -851,6 +972,7 @@ function App() {
     playing,
     page,
     quietUntil,
+    readingDelays,
     safeChunkIndex,
     settings,
     stableChunks,
@@ -906,7 +1028,8 @@ function App() {
 
   useEffect(() => {
     const canHide = Boolean(document)
-      && page === 'reader'
+      && (page === 'reader' || page === 'focus')
+      && settings.autoHideFocusUi
       && overlay === 'none'
       && !settingsOpen
       && !semanticOpen
@@ -945,6 +1068,7 @@ function App() {
     overlay,
     page,
     semanticOpen,
+    settings.autoHideFocusUi,
     settingsOpen,
     shortcutsOpen,
     textOpen,
@@ -1042,6 +1166,7 @@ function App() {
         speech.currentTime = 0
         speech.onloadedmetadata = null
         speech.onplay = null
+        speech.ontimeupdate = null
         speech.onended = null
         speech.onerror = null
         speech.removeAttribute('src')
@@ -1062,7 +1187,6 @@ function App() {
       return
     }
 
-    const targetDuration = getChunkDelay(readerNarrationChunk, effectiveWpm, settings.clarityPauses)
     const synthesisRate = toEdgeTtsRate(effectiveWpm)
     const cast = narrationCast ?? {
       narratorVoice: settings.shortsformTtsVoice,
@@ -1074,14 +1198,42 @@ function App() {
     let fallbackStarted = false
 
     const narrationChunkIndex = findChunkForWord(shortsformChunks, readerNarrationChunk.startWordIndex)
+    const targetDuration = narrationDelays[narrationChunkIndex]
+      ?? getChunkDelay(readerNarrationChunk, effectiveWpm, settings.clarityPauses, pauseDurations)
     const nextChunk = shortsformChunks[narrationChunkIndex + 1]
     if (nextChunk) {
       const nextVoice = resolveNarrationVoice(nextChunk.text, cast).voiceName
       void getShortsformTtsAudio(nextChunk, synthesisRate, nextVoice).catch(() => undefined)
     }
 
+    const showNarratedWord = (wordIndex: number) => {
+      if (page !== 'focus') return
+      readerWordIndexRef.current = wordIndex
+      wordFocusHighlightRef.current(wordIndex)
+    }
+
     const finishPassage = () => {
-      setReaderNarrationStatus(nextChunk ? 'Waiting for the next phrase' : 'Narration complete')
+      if (!active) return
+      setSessionWordsRead((value) => value + readerNarrationChunk.tokens.length)
+      setSessionReadingMs((value) => value + targetDuration)
+      setMetrics((value) => ({
+        ...value,
+        focusedSeconds: value.focusedSeconds + targetDuration / 1000,
+      }))
+      setStableChunks((value) => value + 1)
+      if (!nextChunk) {
+        setReaderNarrationStatus('Narration complete')
+        setPlaying(false)
+        setOverlay('complete')
+        return
+      }
+      setReaderNarrationStatus('Preparing the next phrase…')
+      setChunkIndex(page === 'focus'
+        ? findChunkForWord(focusChunks, nextChunk.startWordIndex)
+        : narrationChunkIndex + 1)
+      void persistPositionRef.current(page === 'focus'
+        ? findChunkForWord(focusChunks, nextChunk.startWordIndex)
+        : narrationChunkIndex + 1)
     }
 
     const startBrowserNarration = () => {
@@ -1093,6 +1245,18 @@ function App() {
       utterance.pitch = settings.shortsformTtsPitch
       utterance.lang = voice.slice(0, 5)
       utterance.onstart = () => setReaderNarrationStatus(`Narrating ${assignment.character} with browser voice`)
+      utterance.onboundary = (event) => {
+        if (event.name && event.name !== 'word') return
+        let cursor = 0
+        const tokenOffset = readerNarrationChunk.tokens.findIndex((token) => {
+          const tokenStart = readerNarrationChunk.text.indexOf(token.text, cursor)
+          cursor = tokenStart < 0 ? cursor : tokenStart + token.text.length
+          return tokenStart >= 0 && event.charIndex < cursor
+        })
+        if (tokenOffset >= 0) {
+          showNarratedWord(readerNarrationChunk.startWordIndex + tokenOffset)
+        }
+      }
       utterance.onend = finishPassage
       utterance.onerror = () => {
         setReaderNarrationStatus('Narration could not start')
@@ -1106,7 +1270,7 @@ function App() {
 
     setReaderNarrationStatus(`Preparing ${assignment.character}…`)
     void getShortsformTtsAudio(readerNarrationChunk, synthesisRate, voice)
-      .then(async ({ blob }) => {
+      .then(async ({ blob, timings }) => {
         if (!active) return
         const objectUrl = URL.createObjectURL(blob)
         readerNarrationAudioUrlRef.current = objectUrl
@@ -1119,6 +1283,11 @@ function App() {
           )
         }
         speech.onplay = () => setReaderNarrationStatus(`Narrating ${assignment.character} with ${voice}`)
+        speech.ontimeupdate = () => {
+          const timingIndex = getTtsTimingIndex(timings, speech.currentTime * 1000)
+          const timing = timings[timingIndex]
+          if (timing) showNarratedWord(readerNarrationChunk.startWordIndex + timing.tokenOffset)
+        }
         speech.onended = finishPassage
         speech.onerror = () => {
           stopSpeech()
@@ -1151,13 +1320,16 @@ function App() {
     getShortsformTtsAudio,
     narrationCast,
     narrationMode,
+    narrationDelays,
     page,
     playing,
     readerNarrationChunk,
+    focusChunks,
     shortsformChunks,
     settings.clarityPauses,
     settings.audioMode,
     settings.audioVolume,
+    pauseDurations,
     settings.shortsformTtsPitch,
     settings.shortsformTtsRate,
     settings.shortsformTtsVoice,
@@ -1220,17 +1392,22 @@ function App() {
       } else if (matchesHotkey(event, settings.hotkeys.narration)) {
         event.preventDefault()
         toggleNarration()
-      } else if (event.code === 'KeyB') pauseForContext('break')
-      else if (event.code === 'KeyR') restart()
-      else if (matchesHotkey(event, settings.hotkeys.settings)) setSettingsOpen((value) => !value)
-      else if (matchesHotkey(event, settings.hotkeys.textView)) setTextOpen(true)
-      else if (event.code === 'KeyN') setNotesOpen(true)
-      else if (matchesHotkey(event, settings.hotkeys.previous)) smartRewind()
-      else if (matchesHotkey(event, settings.hotkeys.next)) setChunkIndex((value) => Math.min(value + 1, chunks.length - 1))
-      else if (event.code === 'KeyM') handleComprehension(true)
-      else if (event.code === 'KeyL') losingFocus()
-      else if (event.code === 'Digit1' || event.code === 'KeyI') addReaction('important')
-      else if (event.code === 'Digit2') addReaction('confused')
+      } else if (event.code === 'KeyB') { event.preventDefault(); pauseForContext('break') }
+      else if (event.code === 'KeyR') { event.preventDefault(); restart() }
+      else if (event.code === 'KeyO') { event.preventDefault(); setImportOpen(true) }
+      else if (matchesHotkey(event, settings.hotkeys.settings)) { event.preventDefault(); setSettingsOpen((value) => !value) }
+      else if (matchesHotkey(event, settings.hotkeys.textView)) { event.preventDefault(); setTextOpen((value) => !value) }
+      else if (event.code === 'KeyN') { event.preventDefault(); setNotesOpen((value) => !value) }
+      else if (event.code === 'Slash' && event.shiftKey) { event.preventDefault(); setShortcutsOpen((value) => !value) }
+      else if (event.code === 'KeyG') { event.preventDefault(); setPage('guide') }
+      else if (event.code === 'KeyP') { event.preventDefault(); setSprintSeconds((settings.sprintMinutes || 5) * 60) }
+      else if (matchesHotkey(event, settings.hotkeys.previous)) { event.preventDefault(); smartRewind() }
+      else if (matchesHotkey(event, settings.hotkeys.next)) { event.preventDefault(); setChunkIndex((value) => Math.min(value + 1, chunks.length - 1)) }
+      else if (event.code === 'KeyM') { event.preventDefault(); handleComprehension(true) }
+      else if (event.code === 'KeyL') { event.preventDefault(); losingFocus() }
+      else if (event.code === 'KeyK') { event.preventDefault(); lockedIn() }
+      else if (event.code === 'Digit1' || event.code === 'KeyI') { event.preventDefault(); addReaction('important') }
+      else if (event.code === 'Digit2') { event.preventDefault(); addReaction('confused') }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -1238,6 +1415,8 @@ function App() {
 
   function restart() {
     setPlaying(false)
+    setSessionWordsRead(0)
+    setSessionReadingMs(0)
     setChunkIndex(0)
     setMetrics(EMPTY_METRICS)
     setAdaptiveOffset(0)
@@ -1289,6 +1468,8 @@ function App() {
       setDocument(parsed)
       setChunkIndex(0)
       setMetrics(EMPTY_METRICS)
+      setSessionWordsRead(0)
+      setSessionReadingMs(0)
       setReactions([])
       setOverlay('none')
       await saveQueueItem({
@@ -1305,16 +1486,6 @@ function App() {
       setError(reason instanceof Error ? reason.message : 'Document import failed.')
     } finally {
       setImporting(false)
-    }
-  }
-
-  async function handleImport(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]
-    if (!file) return
-    try {
-      await completeImport(() => importDocument(file))
-    } finally {
-      event.target.value = ''
     }
   }
 
@@ -1398,6 +1569,8 @@ function App() {
     '--reader-font': settings.fontFamily,
     '--reader-size': `${settings.fontSize}px`,
     '--reader-weight': settings.fontWeight,
+    '--word-focus-scale': settings.wordFocusTextScale / 100,
+    '--word-focus-line-height': settings.wordFocusLineSpacing / 100,
     '--focus-strength': settings.focusWindowStrength / 100,
   } as CSSProperties
 
@@ -1425,8 +1598,11 @@ function App() {
           <button className={page === 'guide' ? 'active' : ''} onClick={() => navigateToPage('guide')} type="button">Guide</button>
         </nav>
         <div className="topbar-meta">
-          {document ? <span>{document.title}</span> : <span>No document</span>}
-          <button aria-label="Semantic search" onClick={() => setSemanticOpen(true)} title="Semantic search (Ctrl/Cmd+K)" type="button"><Search size={17} /></button>
+          {authControls ? <div className="topbar-auth">{authControls}</div> : null}
+          <button aria-label="Import (O)" className="topbar-import" onClick={() => setImportOpen(true)} title="Import (O)" type="button">
+            <FileUp size={16} />
+          </button>
+          <button aria-label="Semantic search" className="topbar-search" onClick={() => setSemanticOpen(true)} title="Semantic search (Ctrl/Cmd+K)" type="button"><Search size={17} /></button>
         </div>
       </header>
 
@@ -1509,7 +1685,7 @@ function App() {
                 <ChunkView
                   chunk={currentChunk}
                   narrationActive={narrationMode}
-                  showFocusPoint={settings.showFocusPoint}
+                  showFocusPoint={settings.showFocusPoint && !narrationMode}
                   showRoles={settings.showRoleHighlights}
                 />
               </div>
@@ -1560,12 +1736,9 @@ function App() {
 
           <Dock
             playing={playing}
-            importing={importing}
             settingsOpen={settingsOpen}
             focusMode={focusMode}
             narrationMode={narrationMode}
-            onImport={handleImport}
-            onOpenImport={() => setImportOpen(true)}
             onRestart={restart}
             onRewind={smartRewind}
             onToggle={togglePlayback}
@@ -1582,8 +1755,6 @@ function App() {
             onSettings={() => setSettingsOpen((value) => !value)}
             onFocusMode={() => setFocusMode((value) => !value)}
             onNarration={toggleNarration}
-            onGuide={() => setPage('guide')}
-            onShortcuts={() => setShortcutsOpen(true)}
           />
 
           {settingsOpen ? (
@@ -1606,13 +1777,14 @@ function App() {
           ) : null}
         </main>
       ) : page === 'focus' ? (
-        <main className="reader-page word-focus-page">
+        <main className={`reader-page word-focus-page${playing ? ' playing' : ''}`}>
           <Background settings={settings} mediaRef={mediaRef} youtubeRef={youtubeRef} />
           <div className="media-scrim" style={{ opacity: settings.backgroundDim / 100 }} />
           <WordFocusDocument
             activeWordStart={currentChunk?.startWordIndex ?? 0}
             document={document}
             importing={importing}
+            onHighlightReady={registerWordFocusHighlighter}
             onOpenImport={() => setImportOpen(true)}
             onJump={jumpToFocusWord}
             settings={settings}
@@ -1663,12 +1835,9 @@ function App() {
           <Dock
             label="Word Focus controls"
             playing={playing}
-            importing={importing}
             settingsOpen={settingsOpen}
             focusMode={focusMode}
             narrationMode={narrationMode}
-            onImport={handleImport}
-            onOpenImport={() => setImportOpen(true)}
             onRestart={restart}
             onRewind={smartRewind}
             onToggle={togglePlayback}
@@ -1685,8 +1854,6 @@ function App() {
             onSettings={() => setSettingsOpen((value) => !value)}
             onFocusMode={() => setFocusMode((value) => !value)}
             onNarration={toggleNarration}
-            onGuide={() => setPage('guide')}
-            onShortcuts={() => setShortcutsOpen(true)}
           />
 
           {settingsOpen ? (
@@ -1730,7 +1897,7 @@ function App() {
           wordIndex={shortsformWordIndex}
         />
       ) : (
-        <GuidePage queryStatus={semanticStatus} runtimeStatus={runtimeStatus} />
+        <GuidePage queryStatus={semanticStatus} runtimeStatus={runtimeStatus} settings={settings} />
       )}
 
       <ImportDialog
@@ -1790,13 +1957,7 @@ function App() {
 
       <Modal open={shortcutsOpen} title="Keyboard shortcuts" onClose={() => setShortcutsOpen(false)}>
         <div className="shortcut-grid">
-          {[
-            [settings.hotkeys.playPause, 'Play / pause'], ['B', 'Break with summary'], ['R', 'Restart'],
-            [settings.hotkeys.focusMode, 'Focus mode'], [settings.hotkeys.narration, 'Narration / highlight'],
-            [settings.hotkeys.settings, 'Settings'], [settings.hotkeys.textView, 'Text view'], ['N', 'Notes'],
-            [settings.hotkeys.previous, 'Smart rewind'], [settings.hotkeys.next, 'Next chunk'], ['M', 'Makes sense'], ['L', 'Losing focus'],
-            ['1 / I', 'Important'], ['2 / ?', 'Confused'], ['Ctrl/Cmd+K', 'Semantic search'],
-          ].map(([key, label]) => <div key={key}><kbd>{key}</kbd><span>{label}</span></div>)}
+          {getShortcutRows(settings).map(([key, label]) => <div key={key}><kbd>{key}</kbd><span>{label}</span></div>)}
         </div>
       </Modal>
 
@@ -2055,13 +2216,29 @@ function ShortsformPage(props: {
   useEffect(() => setBookRights(false), [props.document?.id])
   useEffect(() => () => footageAbortRef.current?.abort(), [])
 
-  async function prepareFootage() {
+  function previewYoutubeFootage() {
+    if (!footageRights || !footageUrl.trim()) return
+    const previewUrl = toYoutubeEmbed(footageUrl.trim())
+    if (!previewUrl) {
+      setStatus('Enter a valid YouTube or youtu.be URL.')
+      return
+    }
+    setFootage({
+      assetId: '',
+      kind: 'youtube',
+      previewUrl,
+      title: 'YouTube preview',
+    })
+    setStatus('YouTube preview ready. Cache a compact copy only if you need local reuse or export.')
+  }
+
+  async function cacheYoutubeFootage() {
     if (!footageRights || !footageUrl.trim()) return
     const controller = new AbortController()
     footageAbortRef.current?.abort()
     footageAbortRef.current = controller
     setPreparingFootage(true)
-    setStatus('Preparing a 720p copy. Longer videos may take a few minutes.')
+    setStatus('Caching a compact 360p, 10-minute background clip without audio…')
     try {
       const response = await fetch('/api/shortsform/footage', {
         method: 'POST',
@@ -2071,11 +2248,11 @@ function ShortsformPage(props: {
       })
       const body = await response.json()
       if (!response.ok) throw new Error(body.error ?? 'Footage preparation failed.')
-      setFootage(body)
-      setStatus(`Footage ready: ${body.title}`)
+      setFootage({ ...body, kind: 'local' })
+      setStatus(body.cached ? `Using cached footage: ${body.title}` : `Compact footage ready: ${body.title}`)
     } catch (reason) {
       setStatus(controller.signal.aborted
-        ? 'Footage preparation cancelled.'
+        ? 'Footage caching cancelled.'
         : reason instanceof Error ? reason.message : 'Footage preparation failed.')
     } finally {
       if (footageAbortRef.current === controller) footageAbortRef.current = null
@@ -2103,7 +2280,7 @@ function ShortsformPage(props: {
       })
       const body = await response.json()
       if (!response.ok) throw new Error(body.error ?? 'Footage upload failed.')
-      setFootage(body)
+      setFootage({ ...body, kind: 'local' })
       setStatus(`Footage ready: ${body.title}`)
     } catch (reason) {
       setStatus(reason instanceof Error ? reason.message : 'Footage upload failed.')
@@ -2127,9 +2304,22 @@ function ShortsformPage(props: {
   const canPlay = Boolean(props.document && bookRights)
 
   return (
-    <main className="shortsform-mode">
+    <main
+      className="shortsform-mode"
+      style={{
+        '--shortsform-dim': props.settings.shortsformBackdropDim / 100,
+        '--shortsform-blur': `${props.settings.shortsformFootageBlur}px`,
+      } as CSSProperties}
+    >
       <div className="shortsform-backdrop">
-        {footage ? (
+        {footage?.kind === 'youtube' ? (
+          <iframe
+            allow="autoplay; encrypted-media"
+            className="shortsform-media shortsform-youtube"
+            src={footage.previewUrl}
+            title="YouTube gameplay preview"
+          />
+        ) : footage ? (
           <video autoPlay className="shortsform-media" loop muted playsInline src={footage.previewUrl} />
         ) : (
           <div className="shortsform-media-empty">
@@ -2160,7 +2350,7 @@ function ShortsformPage(props: {
         <div className={props.settingsOpen ? 'shortsform-layout settings-open' : 'shortsform-layout'}>
           {props.settingsOpen ? (
             <aside className="shortsform-settings">
-              <h2>Source rights</h2>
+              <h2><Video size={15} />Source rights</h2>
               <Toggle
                 checked={bookRights}
                 label="I own this text or have permission to narrate it."
@@ -2183,14 +2373,21 @@ function ShortsformPage(props: {
                 onChange={setFootageRights}
               />
               <button
-                disabled={!footageRights || !footageUrl.trim() || preparingFootage}
-                onClick={() => void prepareFootage()}
+                disabled={!footageRights || !footageUrl.trim()}
+                onClick={previewYoutubeFootage}
                 type="button"
               >
-                {preparingFootage ? 'Preparing footage…' : 'Prepare footage'}
+                Use YouTube preview
+              </button>
+              <button
+                disabled={!footageRights || !footageUrl.trim() || preparingFootage}
+                onClick={() => void cacheYoutubeFootage()}
+                type="button"
+              >
+                {preparingFootage ? 'Caching compact copy…' : 'Cache compact copy'}
               </button>
               {preparingFootage ? (
-                <button onClick={() => footageAbortRef.current?.abort()} type="button">Cancel preparation</button>
+                <button onClick={() => footageAbortRef.current?.abort()} type="button">Cancel caching</button>
               ) : null}
               <label className={`shortsform-button shortsform-upload${!footageRights || preparingFootage ? ' disabled' : ''}`}>
                 Upload video
@@ -2203,18 +2400,27 @@ function ShortsformPage(props: {
                 />
               </label>
 
-              <h2>Captions</h2>
-              <Range label={`Speed · ${props.settings.shortsformWpm} WPM`} min={50} max={1000} step={10} value={props.settings.shortsformWpm} onChange={(value) => props.onChange('shortsformWpm', value)} />
-              <Range label={`Subtitle scale · ${props.settings.shortsformSubtitleScale}%`} min={75} max={160} step={5} value={props.settings.shortsformSubtitleScale} onChange={(value) => props.onChange('shortsformSubtitleScale', value)} />
-              <Range label={`Line length · ${props.settings.shortsformCaptionMaxWords} words`} min={2} max={8} value={props.settings.shortsformCaptionMaxWords} onChange={(value) => props.onChange('shortsformCaptionMaxWords', value)} />
+              <h2><Gauge size={15} />Captions</h2>
+              <WpmRuler ariaLabel="Speed" label="Shortsform speed" value={props.settings.shortsformWpm} onChange={(value) => props.onChange('shortsformWpm', value)} />
+              <div className="shortsform-control-grid">
+                <Range icon={<Focus size={14} />} label={`Subtitle scale · ${props.settings.shortsformSubtitleScale}%`} min={75} max={160} step={5} value={props.settings.shortsformSubtitleScale} onChange={(value) => props.onChange('shortsformSubtitleScale', value)} />
+                <Range icon={<BookOpen size={14} />} label={`Line length · ${props.settings.shortsformCaptionMaxWords} words`} min={2} max={8} value={props.settings.shortsformCaptionMaxWords} onChange={(value) => props.onChange('shortsformCaptionMaxWords', value)} />
+              </div>
               <Select label="Caption theme" value={props.settings.shortsformSubtitleStyle} options={SHORTSFORM_SUBTITLE_STYLES} onChange={(value) => props.onChange('shortsformSubtitleStyle', value as ShortsformSubtitleStyle)} />
               <Select label="Subtitle case" value={props.settings.shortsformSubtitleCase} options={['uppercase', 'natural']} onChange={(value) => props.onChange('shortsformSubtitleCase', value as ShortsformSubtitleCase)} />
               <Select label="Caption alignment" value={props.settings.shortsformCaptionAlign} options={['center', 'left']} onChange={(value) => props.onChange('shortsformCaptionAlign', value as ShortsformCaptionAlign)} />
+              <Select label="Caption position" value={props.settings.shortsformCaptionPosition} options={['top', 'center', 'bottom']} onChange={(value) => props.onChange('shortsformCaptionPosition', value as ShortsformCaptionPosition)} />
+              <div className="shortsform-control-grid">
+                <Range icon={<Video size={14} />} label={`Backdrop dim · ${props.settings.shortsformBackdropDim}%`} min={20} max={92} step={2} value={props.settings.shortsformBackdropDim} onChange={(value) => props.onChange('shortsformBackdropDim', value)} />
+                <Range icon={<Video size={14} />} label={`Footage blur · ${props.settings.shortsformFootageBlur}px`} min={0} max={18} value={props.settings.shortsformFootageBlur} onChange={(value) => props.onChange('shortsformFootageBlur', value)} />
+              </div>
 
-              <h2>Narration</h2>
+              <h2><MessageSquareText size={15} />Narration</h2>
               <Toggle checked={props.settings.shortsformTts} label="Edge TTS narration" onChange={(value) => props.onChange('shortsformTts', value)} />
-              <Range label={`TTS rate · ${props.settings.shortsformTtsRate.toFixed(1)}×`} min={0.7} max={1.8} step={0.1} value={props.settings.shortsformTtsRate} onChange={(value) => props.onChange('shortsformTtsRate', value)} />
-              <Range label={`TTS pitch · ${props.settings.shortsformTtsPitch.toFixed(1)}×`} min={0.6} max={1.6} step={0.1} value={props.settings.shortsformTtsPitch} onChange={(value) => props.onChange('shortsformTtsPitch', value)} />
+              <div className="shortsform-control-grid">
+                <Range icon={<Gauge size={14} />} label={`TTS rate · ${props.settings.shortsformTtsRate.toFixed(1)}×`} min={0.7} max={1.8} step={0.1} value={props.settings.shortsformTtsRate} onChange={(value) => props.onChange('shortsformTtsRate', value)} />
+                <Range icon={<MessageSquareText size={14} />} label={`TTS pitch · ${props.settings.shortsformTtsPitch.toFixed(1)}×`} min={0.6} max={1.6} step={0.1} value={props.settings.shortsformTtsPitch} onChange={(value) => props.onChange('shortsformTtsPitch', value)} />
+              </div>
               <label>
                 <span>Voice</span>
                 <select aria-label="Shortsform voice" value={props.settings.shortsformTtsVoice} onChange={(event) => props.onChange('shortsformTtsVoice', event.target.value)}>
@@ -2233,6 +2439,7 @@ function ShortsformPage(props: {
                   `subtitle-style-${props.settings.shortsformSubtitleStyle}`,
                   `subtitle-case-${props.settings.shortsformSubtitleCase}`,
                   `subtitle-align-${props.settings.shortsformCaptionAlign}`,
+                  `subtitle-position-${props.settings.shortsformCaptionPosition}`,
                 ].join(' ')}
                 style={{ '--subtitle-scale': props.settings.shortsformSubtitleScale / 100 } as CSSProperties}
               >
@@ -2300,45 +2507,73 @@ function WordFocusDocument(props: {
   activeWordStart: number
   document: ParsedDocument | null
   importing: boolean
+  onHighlightReady: (highlight: (wordIndex: number) => void) => void
   onOpenImport: () => void
   onJump: (wordIndex: number) => void
   settings: ReaderSettings
 }) {
+  const activeWordStart = props.activeWordStart
+  const documentId = props.document?.id
+  const onHighlightReady = props.onHighlightReady
+  const showRoleHighlights = props.settings.showRoleHighlights
+  const windowAnchor = Math.floor(props.activeWordStart / WORD_FOCUS_WINDOW_STEP) * WORD_FOCUS_WINDOW_STEP
+  const windowStart = Math.max(0, windowAnchor - WORD_FOCUS_WINDOW_SIZE / 3)
+  const windowEnd = Math.min(
+    (props.document?.tokens.length ?? 1) - 1,
+    windowStart + WORD_FOCUS_WINDOW_SIZE - 1,
+  )
   const tokenRefs = useRef(new Map<number, HTMLSpanElement>())
   const previousWordRef = useRef<number | null>(null)
+  const lastScrollWordRef = useRef<number | null>(null)
+  const scrollFrameRef = useRef<number | null>(null)
   const registerToken = useCallback((wordIndex: number, node: HTMLSpanElement | null) => {
     if (node) tokenRefs.current.set(wordIndex, node)
     else tokenRefs.current.delete(wordIndex)
   }, [])
 
-  useLayoutEffect(() => {
-    const previousToken = previousWordRef.current === null
-      ? null
-      : tokenRefs.current.get(previousWordRef.current)
-    const activeToken = tokenRefs.current.get(props.activeWordStart)
-
+  const highlightWord = useCallback((wordIndex: number) => {
+    const previousWord = previousWordRef.current
+    const previousToken = previousWord === null ? null : tokenRefs.current.get(previousWord)
+    const activeToken = tokenRefs.current.get(wordIndex)
     previousToken?.classList.remove('active')
     previousToken?.removeAttribute('aria-current')
     previousToken?.closest('p')?.classList.remove('active-paragraph')
-
     activeToken?.classList.add('active')
     activeToken?.setAttribute('aria-current', 'true')
     activeToken?.closest('p')?.classList.add('active-paragraph')
-    previousWordRef.current = props.activeWordStart
+    previousWordRef.current = wordIndex
 
     const scroller = activeToken?.closest<HTMLElement>('.word-focus-scroll')
     if (!activeToken || !scroller) return
-    const tokenRect = activeToken.getBoundingClientRect()
-    const scrollerRect = scroller.getBoundingClientRect()
-    const upperBound = scrollerRect.top + scrollerRect.height * 0.3
-    const lowerBound = scrollerRect.top + scrollerRect.height * 0.7
-    if (tokenRect.top >= upperBound && tokenRect.bottom <= lowerBound) return
+    const lastScrollWord = lastScrollWordRef.current
+    if (lastScrollWord !== null && Math.abs(wordIndex - lastScrollWord) < 12) return
+    if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current)
+    scrollFrameRef.current = requestAnimationFrame(() => {
+      scrollFrameRef.current = null
+      lastScrollWordRef.current = wordIndex
+      const tokenRect = activeToken.getBoundingClientRect()
+      const scrollerRect = scroller.getBoundingClientRect()
+      const upperBound = scrollerRect.top + scrollerRect.height * 0.2
+      const lowerBound = scrollerRect.top + scrollerRect.height * 0.8
+      if (tokenRect.top >= upperBound && tokenRect.bottom <= lowerBound) return
+      scroller.scrollTop += tokenRect.top
+        - scrollerRect.top
+        - scrollerRect.height / 2
+        + tokenRect.height / 2
+    })
+  }, [])
 
-    scroller.scrollTop += tokenRect.top
-      - scrollerRect.top
-      - scrollerRect.height / 2
-      + tokenRect.height / 2
-  }, [props.activeWordStart, props.document, props.settings.showRoleHighlights])
+  useLayoutEffect(() => {
+    onHighlightReady(highlightWord)
+    return () => {
+      onHighlightReady(() => {})
+      if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current)
+    }
+  }, [highlightWord, onHighlightReady])
+
+  useLayoutEffect(() => {
+    highlightWord(activeWordStart)
+  }, [activeWordStart, documentId, highlightWord, showRoleHighlights])
 
   if (!props.document) {
     return (
@@ -2359,6 +2594,8 @@ function WordFocusDocument(props: {
         onJump={props.onJump}
         registerToken={registerToken}
         showRoleHighlights={props.settings.showRoleHighlights}
+        windowEnd={windowEnd}
+        windowStart={windowStart}
       />
     </div>
   )
@@ -2369,15 +2606,26 @@ const WordFocusContent = memo(function WordFocusContent(props: {
   onJump: (wordIndex: number) => void
   registerToken: (wordIndex: number, node: HTMLSpanElement | null) => void
   showRoleHighlights: boolean
+  windowEnd: number
+  windowStart: number
 }) {
   return (
     <article className="word-focus-document" aria-label={props.document.title}>
-      {props.document.sections.map((section) => (
+      {props.document.sections.filter((section) => (
+        section.tokenEnd >= props.windowStart && section.tokenStart <= props.windowEnd
+      )).map((section) => (
         <section key={section.id}>
-          {section.title && !/^Section \d+$/i.test(section.title) ? <h2>{section.title}</h2> : null}
-          {section.paragraphs.map((paragraph) => (
+          {section.title && !/^Section \d+$/i.test(section.title) && section.tokenStart >= props.windowStart
+            ? <h2>{section.title}</h2>
+            : null}
+          {section.paragraphs.filter((paragraph) => (
+            paragraph.tokenEnd >= props.windowStart && paragraph.tokenStart <= props.windowEnd
+          )).map((paragraph) => (
             <p key={paragraph.id}>
-              {props.document.tokens.slice(paragraph.tokenStart, paragraph.tokenEnd + 1).map((token, index, tokens) => (
+              {props.document.tokens.slice(
+                Math.max(paragraph.tokenStart, props.windowStart),
+                Math.min(paragraph.tokenEnd, props.windowEnd) + 1,
+              ).map((token) => (
                 <span key={token.id}>
                   <span
                     className={[
@@ -2389,7 +2637,7 @@ const WordFocusContent = memo(function WordFocusContent(props: {
                   >
                     {token.text}
                   </span>
-                  {shouldSpace(token, tokens[index + 1]) ? ' ' : ''}
+                  {shouldSpace(token, props.document.tokens[token.source.wordIndex + 1]) ? ' ' : ''}
                 </span>
               ))}
             </p>
@@ -2499,12 +2747,9 @@ function Progress({ progress, document, showMilestones, onJump }: {
 function Dock(props: {
   label?: string
   playing: boolean
-  importing: boolean
   settingsOpen: boolean
   focusMode: boolean
   narrationMode: boolean
-  onImport: (event: ChangeEvent<HTMLInputElement>) => void
-  onOpenImport: () => void
   onRestart: () => void
   onRewind: () => void
   onToggle: () => void
@@ -2521,45 +2766,88 @@ function Dock(props: {
   onSettings: () => void
   onFocusMode: () => void
   onNarration: () => void
-  onGuide: () => void
-  onShortcuts: () => void
 }) {
-  const actions: Array<[string, ReactNode, () => void, boolean?]> = [
-    ['Restart', <ListRestart />, props.onRestart],
-    ['Rewind', <ArrowLeft />, props.onRewind],
-    [props.playing ? 'Pause' : 'Play', props.playing ? <CirclePause /> : <CirclePlay />, props.onToggle, true],
-    ['Next', <ArrowRight />, props.onNext],
-    ['Break', <Clock3 />, props.onBreak],
-    ['Sprint', <Gauge />, props.onSprint],
-    ['Text', <BookOpen />, props.onText],
-    [props.focusMode ? 'Exit focus' : 'Focus mode', <Focus />, props.onFocusMode],
-    [props.narrationMode ? 'Stop narration' : 'Narration', <MessageSquareText />, props.onNarration],
-    ['Notes', <MessageSquareText />, props.onNotes],
-    ['Clear', <Focus />, props.onUnderstood],
-    ['Losing focus', <AlertCircle />, props.onLosingFocus],
-    ['Locked in', <Sparkles />, props.onLockedIn],
-    ['Mark', <Flag />, props.onImportant],
-    ['Confused', <CircleHelp />, props.onConfused],
-    [props.settingsOpen ? 'Close' : 'Settings', props.settingsOpen ? <X /> : <Settings />, props.onSettings],
-    ['Guide', <Brain />, props.onGuide],
-    ['Shortcuts', <CircleHelp />, props.onShortcuts],
+  const groups: Array<Array<{
+    action: () => void
+    icon: ReactNode
+    label: string
+    level?: 'primary' | 'standard' | 'quiet'
+    shortcut: string
+  }>> = [
+    [
+      { action: props.onRestart, icon: <ListRestart />, label: 'Restart', shortcut: 'R' },
+      { action: props.onRewind, icon: <ArrowLeft />, label: 'Rewind', shortcut: 'ArrowLeft' },
+      { action: props.onToggle, icon: props.playing ? <CirclePause /> : <CirclePlay />, label: props.playing ? 'Pause' : 'Play', level: 'primary', shortcut: 'Space' },
+      { action: props.onNext, icon: <ArrowRight />, label: 'Next', shortcut: 'ArrowRight' },
+    ],
+    [
+      { action: props.onBreak, icon: <Clock3 />, label: 'Break', shortcut: 'B' },
+      { action: props.onSprint, icon: <Gauge />, label: 'Sprint', shortcut: 'P' },
+      { action: props.onText, icon: <BookOpen />, label: 'Text', shortcut: 'V' },
+      { action: props.onFocusMode, icon: <Focus />, label: props.focusMode ? 'Exit focus' : 'Focus mode', shortcut: 'F' },
+      { action: props.onNarration, icon: <MessageSquareText />, label: props.narrationMode ? 'Stop narration' : 'Narration', shortcut: 'H' },
+      { action: props.onNotes, icon: <MessageSquareText />, label: 'Notes', shortcut: 'N' },
+    ],
+    [
+      { action: props.onUnderstood, icon: <Focus />, label: 'Clear', level: 'quiet', shortcut: 'M' },
+      { action: props.onLosingFocus, icon: <AlertCircle />, label: 'Losing focus', level: 'quiet', shortcut: 'L' },
+      { action: props.onLockedIn, icon: <Sparkles />, label: 'Locked in', level: 'quiet', shortcut: 'K' },
+      { action: props.onImportant, icon: <Flag />, label: 'Mark', level: 'quiet', shortcut: '1 / I' },
+      { action: props.onConfused, icon: <CircleHelp />, label: 'Confused', level: 'quiet', shortcut: '2' },
+      { action: props.onSettings, icon: props.settingsOpen ? <X /> : <Settings />, label: props.settingsOpen ? 'Close settings' : 'Settings', shortcut: 'S' },
+    ],
   ]
   return (
     <div className="dock" role="toolbar" aria-label={props.label ?? 'Reader controls'}>
-      <button className="dock-action" onClick={props.onOpenImport} title="Import" type="button">
-        <FileUp />
-        <span>{props.importing ? 'Importing' : 'Import'}</span>
-      </button>
-      <input accept={DOCUMENT_ACCEPT} aria-label="Upload" className="visually-hidden" onChange={props.onImport} type="file" />
-      {actions.map(([label, icon, action, primary]) => (
-        <button className={`dock-action ${primary ? 'primary' : ''}`} key={label} onClick={action} title={label} type="button">
-          {icon}
-          <span>{label}</span>
-        </button>
+      {groups.map((actions, index) => (
+        <div className="dock-group" key={index}>
+          {actions.map(({ action, icon, label, level, shortcut }) => (
+            <button
+              aria-label={`${label} (${shortcut})`}
+              className={`dock-action ${level ?? 'standard'}`}
+              key={label}
+              onClick={action}
+              title={`${label} (${shortcut})`}
+              type="button"
+            >
+              {icon}
+              <span className="dock-tooltip">{label}</span>
+              <kbd>{shortcut}</kbd>
+            </button>
+          ))}
+        </div>
       ))}
     </div>
   )
 }
+
+const THEME_CHOICES: Array<{
+  value: ReaderSettings['theme']
+  label: string
+  sample: string
+  palette: [string, string, string]
+}> = [
+  { value: 'light', label: 'Light', sample: 'White page, high clarity', palette: ['#ffffff', '#091717', '#168da0'] },
+  { value: 'paper', label: 'Paper', sample: 'Soft page, custom colors', palette: ['#fbfaf4', '#091717', '#1fb8cd'] },
+  { value: 'sepia', label: 'Sepia', sample: 'Warm long-form reading', palette: ['#e8e0c0', '#4b3426', '#b43b2d'] },
+  { value: 'dark', label: 'Dark', sample: 'Dim room reading', palette: ['#091717', '#fbfaf4', '#1fb8cd'] },
+  { value: 'calm', label: 'Calm', sample: 'Muted SwiftRead palette', palette: ['#101a17', '#dbe7e1', '#7c8f86'] },
+  { value: 'eink', label: 'E-ink', sample: 'Low-stimulation grey', palette: ['#e9e7df', '#181a19', '#2e565e'] },
+  { value: 'high-contrast', label: 'Contrast', sample: 'Maximum separation', palette: ['#000000', '#ffffff', '#00e5ff'] },
+]
+
+const INTENT_CHOICES: Array<{ value: ReaderSettings['mode']; label: string; detail: string }> = [
+  { value: 'skim', label: 'Skim', detail: 'Faster pace, larger chunks' },
+  { value: 'deep-focus', label: 'Deep focus', detail: 'Balanced pace and reset cadence' },
+  { value: 'study', label: 'Study', detail: 'Slower pace, tighter retention' },
+]
+
+const SENSORY_CHOICES: Array<{ value: ReaderSettings['sensoryPreset']; label: string; detail: string }> = [
+  { value: 'neutral', label: 'Neutral', detail: 'Minimal assistance' },
+  { value: 'calm', label: 'Calm', detail: 'Wide focus window and softer contrast' },
+  { value: 'crisp', label: 'Crisp', detail: 'Sharper contrast and narrower window' },
+  { value: 'low-stim', label: 'Low stim', detail: 'E-ink palette with reduced signals' },
+]
 
 function SettingsPanel(props: {
   settings: ReaderSettings
@@ -2590,6 +2878,7 @@ function SettingsPanel(props: {
     ['driftRecovery', 'Drift recovery'],
     ['motionSmoothing', 'Motion smoothing'],
     ['autoHideTitle', 'Auto-hide title'],
+    ['autoHideFocusUi', 'Auto-hide controls'],
     ['contextLadder', 'Context ladder'],
     ['clarityPauses', 'Buffer heavy words'],
     ['dopamineFeedback', 'Calm streaks and nudges'],
@@ -2608,59 +2897,103 @@ function SettingsPanel(props: {
   return (
     <aside className="settings-panel" aria-label="Reader settings">
       <div className="settings-toolbar">
+        <strong>Reader settings</strong>
         <button onClick={props.onRecalibrate} type="button">Recalibrate</button>
         <button onClick={props.onRemoveDocument} type="button">Remove document</button>
       </div>
-      <section>
-        <h2>Reading</h2>
-        <NumberSetting label="Words per minute" min={50} max={1000} step={10} value={s.wpm} onChange={(value) => props.onChange('wpm', value)} />
-        <Range label={`Words per chunk · ${s.chunkSize}`} min={1} max={5} value={s.chunkSize} onChange={(value) => props.onChange('chunkSize', value)} />
-        <Range label={`Font size · ${s.fontSize}px`} min={24} max={120} step={2} value={s.fontSize} onChange={(value) => props.onChange('fontSize', value)} />
-        <Range label={`Font weight · ${s.fontWeight}`} min={400} max={700} step={100} value={s.fontWeight} onChange={(value) => props.onChange('fontWeight', value)} />
-        <Select label="Font family" value={s.fontFamily} options={FONTS} onChange={(value) => props.onChange('fontFamily', value)} />
-        <Select label="Reading mode" value={s.mode} options={['skim', 'deep-focus', 'study']} onChange={(value) => props.onMode(value as ReaderSettings['mode'])} />
+      <section className="settings-section settings-section-primary">
+        <h2><Gauge size={15} />Reading</h2>
+        <WpmRuler value={s.wpm} onChange={(value) => props.onChange('wpm', value)} />
+        <Range icon={<BookOpen size={14} />} label={`Words per chunk · ${s.chunkSize}`} min={1} max={5} value={s.chunkSize} onChange={(value) => props.onChange('chunkSize', value)} />
+        <Range icon={<Focus size={14} />} label={`Font size · ${s.fontSize}px`} min={24} max={120} step={2} value={s.fontSize} onChange={(value) => props.onChange('fontSize', value)} />
+        <Range icon={<Focus size={14} />} label={`Font weight · ${s.fontWeight}`} min={400} max={700} step={100} value={s.fontWeight} onChange={(value) => props.onChange('fontWeight', value)} />
+        <div className="settings-two">
+          <Range icon={<Focus size={14} />} label={`Word Focus text · ${s.wordFocusTextScale}%`} min={32} max={72} step={1} value={s.wordFocusTextScale} onChange={(value) => props.onChange('wordFocusTextScale', value)} />
+          <Range icon={<BookOpen size={14} />} label={`Word Focus lines · ${s.wordFocusLineSpacing}%`} min={120} max={190} step={5} value={s.wordFocusLineSpacing} onChange={(value) => props.onChange('wordFocusLineSpacing', value)} />
+        </div>
+        <div className="settings-two">
+          <Select label="Font family" value={s.fontFamily} options={FONTS} onChange={(value) => props.onChange('fontFamily', value)} />
+          <Select label="Sprint length" value={String(s.sprintMinutes)} options={['0', '5', '10', '15', '25']} onChange={(value) => props.onChange('sprintMinutes', Number(value) as ReaderSettings['sprintMinutes'])} />
+        </div>
+        <OptionCards
+          label="Reading mode"
+          options={INTENT_CHOICES}
+          value={s.mode}
+          onChange={(value) => props.onMode(value as ReaderSettings['mode'])}
+        />
       </section>
-      <section>
-        <h2>Attention</h2>
-        <Range label={`Micro-break interval · ${s.microBreakInterval} chunks`} min={8} max={80} step={2} value={s.microBreakInterval} onChange={(value) => props.onChange('microBreakInterval', value)} />
-        <Range label={`Micro-break length · ${s.microBreakDuration}s`} min={5} max={20} value={s.microBreakDuration} onChange={(value) => props.onChange('microBreakDuration', value)} />
-        <Range label={`Focus window strength · ${s.focusWindowStrength}%`} min={15} max={80} value={s.focusWindowStrength} onChange={(value) => props.onChange('focusWindowStrength', value)} />
-        <Select label="Focus window width" value={s.focusWindowWidth} options={['narrow', 'balanced', 'wide']} onChange={(value) => props.onChange('focusWindowWidth', value as ReaderSettings['focusWindowWidth'])} />
-        <Select label="Sprint length" value={String(s.sprintMinutes)} options={['0', '5', '10', '15', '25']} onChange={(value) => props.onChange('sprintMinutes', Number(value) as ReaderSettings['sprintMinutes'])} />
+      <section className="settings-section">
+        <h2><Focus size={15} />Attention</h2>
+        <Range icon={<Clock3 size={14} />} label={`Micro-break interval · ${s.microBreakInterval} chunks`} min={8} max={80} step={2} value={s.microBreakInterval} onChange={(value) => props.onChange('microBreakInterval', value)} />
+        <Range icon={<Clock3 size={14} />} label={`Micro-break length · ${s.microBreakDuration}s`} min={5} max={20} value={s.microBreakDuration} onChange={(value) => props.onChange('microBreakDuration', value)} />
+        <Range icon={<Focus size={14} />} label={`Focus window strength · ${s.focusWindowStrength}%`} min={15} max={80} value={s.focusWindowStrength} onChange={(value) => props.onChange('focusWindowStrength', value)} />
+        <div className="settings-two">
+          <Range icon={<CirclePause size={14} />} label={`Comma pause · ${s.pauseCommaMs}ms`} min={0} max={600} step={20} value={s.pauseCommaMs} onChange={(value) => props.onChange('pauseCommaMs', value)} />
+          <Range icon={<CirclePause size={14} />} label={`Period pause · ${s.pausePeriodMs}ms`} min={0} max={1000} step={20} value={s.pausePeriodMs} onChange={(value) => props.onChange('pausePeriodMs', value)} />
+        </div>
+        <Range icon={<MessageSquareText size={14} />} label={`Long-word pause · ${s.pauseLongWordMs}ms`} min={0} max={700} step={20} value={s.pauseLongWordMs} onChange={(value) => props.onChange('pauseLongWordMs', value)} />
+        <Segmented
+          label="Focus window width"
+          options={['narrow', 'balanced', 'wide']}
+          value={s.focusWindowWidth}
+          onChange={(value) => props.onChange('focusWindowWidth', value as ReaderSettings['focusWindowWidth'])}
+        />
       </section>
-      <section>
-        <h2>Appearance</h2>
-        <Select label="Theme" value={s.theme} options={['light', 'paper', 'sepia', 'dark', 'eink', 'high-contrast']} onChange={(value) => props.onChange('theme', value as ReaderSettings['theme'])} />
-        <Select label="Contrast" value={s.contrast} options={['soft', 'balanced', 'high']} onChange={(value) => props.onChange('contrast', value as ReaderSettings['contrast'])} />
-        <Select label="Eye anchor style" value={s.eyeAnchorStyle} options={['line', 'grid']} onChange={(value) => props.onChange('eyeAnchorStyle', value as ReaderSettings['eyeAnchorStyle'])} />
-        <Select label="Sensory preset" value={s.sensoryPreset} options={['neutral', 'calm', 'crisp', 'low-stim']} onChange={(value) => props.onPreset(value as ReaderSettings['sensoryPreset'])} />
-        <Range label={`Title auto-hide delay · ${s.autoHideTitleDelay}s`} min={1} max={10} value={s.autoHideTitleDelay} onChange={(value) => props.onChange('autoHideTitleDelay', value)} />
-        <Color label="Custom background color" value={s.backgroundColor} onChange={(value) => {
-          props.onChange('theme', 'paper')
-          props.onChange('backgroundColor', value)
-        }} />
-        <Color label="Custom text color" value={s.textColor} onChange={(value) => {
-          props.onChange('theme', 'paper')
-          props.onChange('textColor', value)
-        }} />
+      <section className="settings-section settings-section-wide">
+        <h2><Settings size={15} />Appearance</h2>
+        <ThemePicker value={s.theme} onChange={(value) => props.onChange('theme', value)} />
+        <div className="settings-two">
+          <Segmented label="Contrast" value={s.contrast} options={['soft', 'balanced', 'high']} onChange={(value) => props.onChange('contrast', value as ReaderSettings['contrast'])} />
+          <Segmented label="Eye anchor" value={s.eyeAnchorStyle} options={['line', 'grid']} onChange={(value) => props.onChange('eyeAnchorStyle', value as ReaderSettings['eyeAnchorStyle'])} />
+        </div>
+        <OptionCards
+          label="Sensory preset"
+          options={SENSORY_CHOICES}
+          value={s.sensoryPreset}
+          onChange={(value) => props.onPreset(value as ReaderSettings['sensoryPreset'])}
+        />
+        <div className="settings-two custom-colors">
+          <Color label="Background" value={s.backgroundColor} onChange={(value) => {
+            props.onChange('theme', 'paper')
+            props.onChange('backgroundColor', value)
+          }} />
+          <Color label="Text" value={s.textColor} onChange={(value) => {
+            props.onChange('theme', 'paper')
+            props.onChange('textColor', value)
+          }} />
+        </div>
+        <div className="inline-actions appearance-actions">
+          <button
+            className="reset-colors"
+            onClick={() => {
+              props.onChange('theme', 'paper')
+              props.onChange('backgroundColor', DEFAULT_READER_COLORS.backgroundColor)
+              props.onChange('textColor', DEFAULT_READER_COLORS.textColor)
+            }}
+            type="button"
+          >
+            Reset colors
+          </button>
+          <Range label={`Title auto-hide delay · ${s.autoHideTitleDelay}s`} min={1} max={10} value={s.autoHideTitleDelay} onChange={(value) => props.onChange('autoHideTitleDelay', value)} />
+        </div>
       </section>
-      <section>
-        <h2>Background media</h2>
+      <section className="settings-section">
+        <h2><Video size={15} />Background media</h2>
         <label>Image, video, or YouTube URL<input value={backgroundUrl} onChange={(event) => setBackgroundUrl(event.target.value)} /></label>
         <div className="inline-actions">
           <button onClick={() => props.onBackgroundUrl(backgroundUrl)} type="button">Apply URL</button>
           <label className="button-label">Upload<input accept="image/*,video/*" hidden onChange={props.onUploadBackground} type="file" /></label>
           <button onClick={props.onRemoveBackground} type="button">Remove</button>
         </div>
-        <Range label={`Opacity · ${s.backgroundOpacity}%`} min={10} max={100} value={s.backgroundOpacity} onChange={(value) => props.onChange('backgroundOpacity', value)} />
-        <Range label={`Dim · ${s.backgroundDim}%`} min={0} max={90} value={s.backgroundDim} onChange={(value) => props.onChange('backgroundDim', value)} />
-        <Range label={`Blur · ${s.backgroundBlur}px`} min={0} max={24} value={s.backgroundBlur} onChange={(value) => props.onChange('backgroundBlur', value)} />
-        <Range label={`Playback rate · ${s.backgroundPlaybackRate.toFixed(1)}×`} min={0.5} max={2} step={0.1} value={s.backgroundPlaybackRate} onChange={(value) => props.onChange('backgroundPlaybackRate', value)} />
+        <Range icon={<Video size={14} />} label={`Opacity · ${s.backgroundOpacity}%`} min={10} max={100} value={s.backgroundOpacity} onChange={(value) => props.onChange('backgroundOpacity', value)} />
+        <Range icon={<Video size={14} />} label={`Dim · ${s.backgroundDim}%`} min={0} max={90} value={s.backgroundDim} onChange={(value) => props.onChange('backgroundDim', value)} />
+        <Range icon={<Video size={14} />} label={`Blur · ${s.backgroundBlur}px`} min={0} max={24} value={s.backgroundBlur} onChange={(value) => props.onChange('backgroundBlur', value)} />
+        <Range icon={<Gauge size={14} />} label={`Playback rate · ${s.backgroundPlaybackRate.toFixed(1)}×`} min={0.5} max={2} step={0.1} value={s.backgroundPlaybackRate} onChange={(value) => props.onChange('backgroundPlaybackRate', value)} />
         <Toggle label="Pause background video" checked={s.backgroundPaused} onChange={(value) => props.onChange('backgroundPaused', value)} />
         <Toggle label="Loop background video" checked={s.backgroundLoop} onChange={(value) => props.onChange('backgroundLoop', value)} />
       </section>
-      <section>
-        <h2>Audio</h2>
+      <section className="settings-section">
+        <h2><MessageSquareText size={15} />Audio</h2>
         <p className="settings-status" role="status">Narration: {props.narrationStatus}</p>
         <p className="settings-status">
           Character voices: {props.narrationCast?.characters.length
@@ -2668,13 +3001,13 @@ function SettingsPanel(props: {
             : 'Narrator only'}
         </p>
         <Select label="Narration voice" value={s.shortsformTtsVoice} options={props.voices.map((voice) => voice.name)} onChange={(value) => props.onChange('shortsformTtsVoice', value)} />
-        <Range label={`Narration pace · ${s.shortsformTtsRate.toFixed(1)}×`} min={0.5} max={2} step={0.1} value={s.shortsformTtsRate} onChange={(value) => props.onChange('shortsformTtsRate', value)} />
-        <Range label={`Narration pitch · ${s.shortsformTtsPitch.toFixed(1)}×`} min={0.5} max={1.5} step={0.1} value={s.shortsformTtsPitch} onChange={(value) => props.onChange('shortsformTtsPitch', value)} />
+        <Range icon={<Gauge size={14} />} label={`Narration pace · ${s.shortsformTtsRate.toFixed(1)}×`} min={0.5} max={2} step={0.1} value={s.shortsformTtsRate} onChange={(value) => props.onChange('shortsformTtsRate', value)} />
+        <Range icon={<MessageSquareText size={14} />} label={`Narration pitch · ${s.shortsformTtsPitch.toFixed(1)}×`} min={0.5} max={1.5} step={0.1} value={s.shortsformTtsPitch} onChange={(value) => props.onChange('shortsformTtsPitch', value)} />
         <Select label="Ambient audio" value={s.audioMode} options={['off', 'soft-drums', 'brown-noise', 'binaural-beats', 'metronome']} onChange={(value) => props.onChange('audioMode', value as ReaderSettings['audioMode'])} />
-        <Range label={`Volume · ${s.audioVolume}%`} min={0} max={100} value={s.audioVolume} onChange={(value) => props.onChange('audioVolume', value)} />
+        <Range icon={<CirclePlay size={14} />} label={`Volume · ${s.audioVolume}%`} min={0} max={100} value={s.audioVolume} onChange={(value) => props.onChange('audioVolume', value)} />
       </section>
-      <section>
-        <h2>Hotkeys</h2>
+      <section className="settings-section">
+        <h2><Settings size={15} />Hotkeys</h2>
         <div className="hotkey-editor">
           {([
             ['playPause', 'Play / pause'],
@@ -2695,20 +3028,149 @@ function SettingsPanel(props: {
           ))}
         </div>
       </section>
-      <section className="toggle-section">
-        <h2>Features</h2>
+      <section className="settings-section toggle-section settings-section-wide">
+        <h2><Sparkles size={15} />Features</h2>
         {toggles.map(([key, label]) => (
           <Toggle key={key} label={label} checked={Boolean(s[key])} onChange={(value) => props.onChange(key, value as never)} />
         ))}
       </section>
-      <section className="runtime">
-        <h2>Runtime status</h2>
+      <section className="settings-section runtime">
+        <h2><AlertCircle size={15} />Runtime status</h2>
         <p>Voice: {props.runtimeStatus.voice}</p>
         <p>Eye tracking: {props.runtimeStatus.eye}</p>
         {props.lastVoiceCommand ? <p>Last command: {props.lastVoiceCommand}</p> : null}
         <p>Camera frames remain local. Semantic vectors remain in IndexedDB. AI receives only selected nearby passages.</p>
       </section>
     </aside>
+  )
+}
+
+function ThemePicker({ value, onChange }: {
+  value: ReaderSettings['theme']
+  onChange: (value: ReaderSettings['theme']) => void
+}) {
+  return (
+    <div className="theme-picker" aria-label="Theme">
+      {THEME_CHOICES.map((theme) => (
+        <button
+          aria-pressed={value === theme.value}
+          className={value === theme.value ? 'active' : ''}
+          key={theme.value}
+          onClick={() => onChange(theme.value)}
+          type="button"
+        >
+          <span className="theme-preview" aria-hidden="true" style={{ background: theme.palette[0], color: theme.palette[1], borderColor: theme.palette[2] }}>
+            <span />
+            <span />
+          </span>
+          <strong>{theme.label}</strong>
+          <span>{theme.sample}</span>
+          <i aria-hidden="true">
+            {theme.palette.map((color) => <b key={color} style={{ background: color }} />)}
+          </i>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function WpmRuler({ ariaLabel = 'Words per minute', label = 'Words per minute', value, onChange }: {
+  ariaLabel?: string
+  label?: string
+  value: number
+  onChange: (value: number) => void
+}) {
+  const min = 50
+  const max = 1000
+  const average = 225
+  const percent = (value - min) / (max - min) * 100
+  const multiplier = value / average
+  const ticks = Array.from({ length: 25 }, (_, index) => index)
+  const update = (next: number) => onChange(Math.max(min, Math.min(max, next)))
+  return (
+    <div className="wpm-ruler-card">
+      <div className="wpm-ruler-head">
+        <span><Gauge size={16} />{label}</span>
+        <strong>{value} WPM</strong>
+        <em>{multiplier.toFixed(2)}x faster than avg</em>
+      </div>
+      <div className="wpm-ruler-track">
+        <input
+          aria-label={ariaLabel}
+          max={max}
+          min={min}
+          onChange={(event) => onChange(Number(event.target.value))}
+          step={10}
+          style={{ '--range-progress': `${percent}%` } as CSSProperties}
+          type="range"
+          value={value}
+        />
+        <div className="wpm-ruler-ticks" aria-hidden="true">
+          {ticks.map((tick) => <span key={tick} className={tick % 4 === 0 ? 'major' : ''} />)}
+        </div>
+        <i style={{ left: `${percent}%` }} aria-hidden="true" />
+      </div>
+      <div className="wpm-ruler-foot">
+        <span>Avg reader {average} WPM</span>
+        <div>
+          <button onClick={() => update(value - 10)} type="button">-10</button>
+          <button onClick={() => update(value + 10)} type="button">+10</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function OptionCards<T extends string>({ label, value, options, onChange }: {
+  label: string
+  value: T
+  options: Array<{ value: T; label: string; detail: string }>
+  onChange: (value: T) => void
+}) {
+  return (
+    <div className="option-card-group" aria-label={label}>
+      <span>{label}</span>
+      <div>
+        {options.map((option) => (
+          <button
+            aria-pressed={value === option.value}
+            className={value === option.value ? 'active' : ''}
+            key={option.value}
+            onClick={() => onChange(option.value)}
+            type="button"
+          >
+            <strong>{option.label}</strong>
+            <span>{option.detail}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function Segmented<T extends string>({ label, value, options, onChange }: {
+  label: string
+  value: T
+  options: T[]
+  onChange: (value: T) => void
+}) {
+  return (
+    <div className="segmented-control" aria-label={label}>
+      <span>{label}</span>
+      <div>
+        {options.map((option) => (
+          <button
+            aria-pressed={value === option}
+            className={value === option ? 'active' : ''}
+            key={option}
+            onClick={() => onChange(option)}
+            type="button"
+          >
+            {option.replaceAll('-', ' ')}
+          </button>
+        ))}
+      </div>
+    </div>
   )
 }
 
@@ -2788,8 +3250,32 @@ function TextViewer(props: {
 }) {
   if (!props.open || !props.document) return null
   const activeMatch = props.matches[Math.min(props.cursor, Math.max(props.matches.length - 1, 0))]
+  const reactionRanges = props.reactions.map((reaction) => ({
+    reaction,
+    range: getReactionRange(reaction, props.document!),
+  }))
+  const anchoredRanges = [
+    { start: props.currentWord, end: props.currentWord },
+    activeMatch ? { start: activeMatch.start, end: activeMatch.end } : null,
+    ...reactionRanges.map(({ range }) => range),
+  ].filter((range): range is { start: number; end: number } => Boolean(range))
+  const windowStart = Math.max(
+    0,
+    Math.min(...anchoredRanges.map((range) => Math.max(0, range.start - TEXT_VIEW_CONTEXT_WORDS))),
+  )
+  const windowEnd = Math.min(
+    props.document.tokens.length - 1,
+    Math.max(
+      windowStart + TEXT_VIEW_WINDOW_SIZE - 1,
+      ...anchoredRanges.map((range) => Math.min(props.document!.tokens.length - 1, range.end + TEXT_VIEW_CONTEXT_WORDS)),
+    ),
+  )
+  const visibleTokens = props.document.tokens.slice(windowStart, windowEnd + 1)
+  const visibleReactions = reactionRanges.filter(({ range }) => (
+    range.end >= windowStart && range.start <= windowEnd
+  ))
   return (
-    <div className="text-viewer">
+    <div className="text-viewer" onKeyDown={(event) => { if (event.key === 'Escape') props.onClose() }}>
       <header>
         <input autoFocus onChange={(event) => props.onQuery(event.target.value)} placeholder="Exact word or phrase…" value={props.query} />
         <button onClick={() => props.onCursor(Math.max(0, props.cursor - 1))} type="button">Previous</button>
@@ -2797,24 +3283,47 @@ function TextViewer(props: {
         <span>{props.matches.length ? `${props.cursor + 1} of ${props.matches.length}` : props.query ? 'No matches' : ''}</span>
         <button onClick={props.onClose} type="button">Close</button>
       </header>
+      {props.document.tokens.length > visibleTokens.length ? (
+        <div className="text-viewer-window" role="status">
+          Showing words {windowStart + 1}-{windowEnd + 1} of {props.document.tokens.length}. Use search or click a note to jump elsewhere.
+        </div>
+      ) : null}
       <article>
-        {props.document.tokens.map((token, index) => {
+        {visibleReactions.map(({ reaction, range }) => (
+          <button
+            className={`reaction-jump reaction-${reaction.kind}`}
+            key={reaction.id}
+            onClick={() => props.onJump(range.start)}
+            type="button"
+          >
+            {reactionLabel(reaction.kind)}: {reaction.preview}
+          </button>
+        ))}
+        {visibleTokens.map((token, offset) => {
+          const index = windowStart + offset
           const highlighted = props.matches.some((match) => index >= match.start && index <= match.end)
           const active = activeMatch && index >= activeMatch.start && index <= activeMatch.end
-          const reaction = props.reactions.some((item) => item.preview.includes(token.text))
+          const reactionItem = visibleReactions.find((item) => index >= item.range.start && index <= item.range.end)
+          const reaction = reactionItem?.reaction
           return (
             <span key={token.id}>
               <button
+                aria-label={reaction ? `${reactionLabel(reaction.kind)} word: ${token.text}` : token.text}
                 className={[
                   'text-token',
                   highlighted ? 'highlighted' : '',
                   active ? 'active-hit' : '',
                   index === props.currentWord ? 'current' : '',
-                  reaction ? 'reaction' : '',
+                  reaction ? `reaction reaction-${reaction.kind}` : '',
                 ].filter(Boolean).join(' ')}
                 onClick={() => props.onJump(index)}
                 type="button"
-              >{token.text}</button>
+              >
+                {reaction && reactionItem && index === reactionItem.range.start ? (
+                  <span className="reaction-label">{reactionLabel(reaction.kind)}</span>
+                ) : null}
+                {token.text}
+              </button>
               {shouldSpace(token, props.document!.tokens[index + 1]) ? ' ' : ''}
             </span>
           )
@@ -2824,9 +3333,35 @@ function TextViewer(props: {
   )
 }
 
-function GuidePage({ queryStatus, runtimeStatus }: {
+function getShortcutRows(settings: ReaderSettings) {
+  return [
+    ['O', 'Import'],
+    [settings.hotkeys.playPause, 'Play / pause'],
+    ['B', 'Break with summary'],
+    ['R', 'Restart'],
+    [settings.hotkeys.focusMode, 'Focus mode'],
+    [settings.hotkeys.narration, 'Narration / highlight'],
+    [settings.hotkeys.settings, 'Settings'],
+    [settings.hotkeys.textView, 'Text view'],
+    ['N', 'Notes'],
+    ['?', 'Shortcuts'],
+    ['G', 'Guide'],
+    ['P', 'Sprint'],
+    [settings.hotkeys.previous, 'Smart rewind'],
+    [settings.hotkeys.next, 'Next chunk'],
+    ['M', 'Makes sense'],
+    ['L', 'Losing focus'],
+    ['K', 'Locked in'],
+    ['1 / I', 'Mark important'],
+    ['2', 'Mark confused'],
+    ['Ctrl/Cmd+K', 'Semantic search'],
+  ]
+}
+
+function GuidePage({ queryStatus, runtimeStatus, settings }: {
   queryStatus: string
   runtimeStatus: { voice: string; eye: string }
+  settings: ReaderSettings
 }) {
   const [query, setQuery] = useState('')
   const filtered = featureRegistry.filter((feature) =>
@@ -2863,6 +3398,12 @@ function GuidePage({ queryStatus, runtimeStatus }: {
         <p>Voice commands: {runtimeStatus.voice}</p>
         <p>Eye tracking: {runtimeStatus.eye}</p>
         <p>Delete a document from Reader settings to remove its text, progress, and local semantic index.</p>
+      </section>
+      <section className="guide-shortcuts">
+        <h2>Keyboard shortcuts</h2>
+        <div className="shortcut-grid">
+          {getShortcutRows(settings).map(([key, label]) => <div key={key}><kbd>{key}</kbd><span>{label}</span></div>)}
+        </div>
       </section>
     </main>
   )
@@ -2953,26 +3494,27 @@ function Modal({ open, title, onClose, children }: { open: boolean; title: strin
   )
 }
 
-function Range({ label, min, max, step = 1, value, onChange }: { label: string; min: number; max: number; step?: number; value: number; onChange: (value: number) => void }) {
-  return <label className="range-setting"><span>{label}</span><input min={min} max={max} step={step} type="range" value={value} onChange={(event) => onChange(Number(event.target.value))} /><small>{min}<span>{max}</span></small></label>
-}
-
-function NumberSetting({ label, min, max, step = 1, value, onChange }: { label: string; min: number; max: number; step?: number; value: number; onChange: (value: number) => void }) {
+function Range({ ariaLabel, icon, label, min, max, step = 1, value, onChange }: { ariaLabel?: string; icon?: ReactNode; label: string; min: number; max: number; step?: number; value: number; onChange: (value: number) => void }) {
+  const percent = (value - min) / (max - min) * 100
+  const [name, metric = String(value)] = label.split(' · ')
   return (
-    <label>
-      <span>{label}</span>
+    <label className="range-setting">
+      <span className="range-label-row">
+        {icon ? <i aria-hidden="true">{icon}</i> : null}
+        <span>{name}</span>
+        <strong>{metric}</strong>
+      </span>
       <input
-        aria-label={label}
+        aria-label={ariaLabel ?? label}
         max={max}
         min={min}
+        onChange={(event) => onChange(Number(event.target.value))}
         step={step}
-        type="number"
+        style={{ '--range-progress': `${percent}%` } as CSSProperties}
+        type="range"
         value={value}
-        onChange={(event) => {
-          const next = Number(event.target.value)
-          if (Number.isFinite(next)) onChange(Math.min(max, Math.max(min, next)))
-        }}
       />
+      <small><span>{min}</span><span>{max}</span></small>
     </label>
   )
 }
@@ -2982,7 +3524,7 @@ function Select({ label, value, options, onChange }: { label: string; value: str
 }
 
 function Color({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
-  return <label className="color-setting"><span>{label}</span><input type="color" value={value} onChange={(event) => onChange(event.target.value)} /><input value={value} onChange={(event) => onChange(event.target.value)} /></label>
+  return <label className="color-setting"><span>{label}</span><input aria-label={`${label} picker`} type="color" value={value} onChange={(event) => onChange(event.target.value)} /><input aria-label={label} value={value} onChange={(event) => onChange(event.target.value)} /></label>
 }
 
 function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (value: boolean) => void }) {
@@ -3025,8 +3567,9 @@ function matchesHotkey(event: globalThis.KeyboardEvent, binding: string) {
 function getThemeStyle(settings: ReaderSettings): Record<string, string> {
   if (settings.theme === 'high-contrast') return { '--bg': '#000000', '--surface': '#000000', '--text': '#ffffff', '--muted': '#ffffff', '--line': '#ffffff', '--accent': '#00e5ff', '--accent-soft': '#101010', '--focus-red': '#ff5a4f', '--anchor-line': 'rgba(255, 255, 255, 0.42)', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
   if (settings.theme === 'dark') return { '--bg': '#091717', '--surface': '#13343b', '--text': '#fbfaf4', '--muted': '#b7c3c1', '--line': '#36555b', '--accent': '#1fb8cd', '--accent-soft': '#204b52', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
+  if (settings.theme === 'calm') return { '--bg': '#101a17', '--surface': '#17241f', '--text': '#dbe7e1', '--muted': '#8fa49a', '--line': '#2b3b35', '--accent': '#7c8f86', '--accent-soft': '#23322d', '--focus-red': '#d4876f', '--anchor-line': 'rgba(219, 231, 225, 0.16)', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
   if (settings.theme === 'eink') return { '--bg': '#e9e7df', '--surface': '#f4f2ea', '--text': '#181a19', '--muted': '#606562', '--line': '#b7bbb6', '--accent': '#2e565e', '--accent-soft': '#d9e6e4', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
-  if (settings.theme === 'sepia') return { '--bg': '#e8e0c0', '--surface': '#ede4cf', '--text': '#4b3426', '--muted': '#725b47', '--line': '#c8b98d', '--accent': '#6f543c', '--accent-soft': '#d8c99e', '--focus-red': '#4b3426', '--focus-document-font': 'Georgia, serif' }
+  if (settings.theme === 'sepia') return { '--bg': '#e8e0c0', '--surface': '#ede4cf', '--text': '#4b3426', '--muted': '#725b47', '--line': '#c8b98d', '--accent': '#6f543c', '--accent-soft': '#d8c99e', '--focus-red': '#b43b2d', '--focus-document-font': 'Georgia, serif' }
   if (settings.theme === 'light') return { '--bg': '#ffffff', '--surface': '#ffffff', '--text': '#091717', '--muted': '#526462', '--line': '#d8dedb', '--accent': '#168da0', '--accent-soft': '#e6f8fa', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
   return { '--bg': settings.backgroundColor, '--surface': '#fffef9', '--text': settings.textColor, '--muted': '#526462', '--line': '#cad2ce', '--accent': '#1fb8cd', '--accent-soft': '#def7f9', '--focus-document-font': "'Atkinson Hyperlegible', sans-serif" }
 }
@@ -3048,7 +3591,35 @@ function getNearbyContext(document: ParsedDocument, chunk: ReadingChunk) {
 }
 
 function makeReaction(document: ParsedDocument, chunk: ReadingChunk, chunkIndex: number, kind: Reaction['kind']): Reaction {
-  return { id: crypto.randomUUID(), documentId: document.id, kind, chunkIndex, preview: chunk.text, createdAt: Date.now() }
+  return {
+    id: crypto.randomUUID(),
+    documentId: document.id,
+    kind,
+    chunkIndex,
+    wordStart: chunk.startWordIndex,
+    wordEnd: chunk.endWordIndex,
+    preview: chunk.text,
+    createdAt: Date.now(),
+  }
+}
+
+function getReactionRange(reaction: Reaction, document: ParsedDocument) {
+  const legacyReaction = reaction as Reaction & { wordStart?: number; wordEnd?: number }
+  if (typeof legacyReaction.wordStart === 'number' && typeof legacyReaction.wordEnd === 'number') {
+    return {
+      start: Math.max(0, Math.min(legacyReaction.wordStart, document.tokens.length - 1)),
+      end: Math.max(0, Math.min(legacyReaction.wordEnd, document.tokens.length - 1)),
+    }
+  }
+  const firstMatch = document.tokens.findIndex((token) => reaction.preview.includes(token.text))
+  const start = Math.max(0, firstMatch)
+  return { start, end: start }
+}
+
+function reactionLabel(kind: Reaction['kind']) {
+  if (kind === 'important') return 'Marked'
+  if (kind === 'confused') return 'Confused'
+  return 'Understood'
 }
 
 function loadStreak(): StreakState {

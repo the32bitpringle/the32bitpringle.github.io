@@ -7,6 +7,7 @@ import {
   findMeaningfulRewind,
   getChunkDelay,
   getFocusPointIndex,
+  getReadingDelays,
 } from './tokenize'
 
 async function fixture() {
@@ -77,11 +78,40 @@ describe('document tokenization', () => {
     expect(getChunkDelay(chunk, 300, true)).toBeGreaterThan(getChunkDelay(chunk, 300, false))
   })
 
+  it('honors custom comma, period, and long-word pauses', async () => {
+    const document = await createParsedDocument({
+      format: 'txt',
+      title: 'Pauses',
+      sections: [{ title: 'Pauses', text: 'Alpha, beta. A technical hyperparameter appeared.' }],
+    }, 'pauses.txt')
+    const chunks = buildChunks(document, 1, 'study')
+    const comma = chunks.find((chunk) => chunk.text.endsWith(','))!
+    const period = chunks.find((chunk) => chunk.text.endsWith('.'))!
+    const difficult = chunks.find((chunk) => chunk.complexity > 0)!
+    expect(getChunkDelay(comma, 300, true, { commaMs: 500, periodMs: 0, longWordMs: 0 })).toBe(700)
+    expect(getChunkDelay(period, 300, true, { commaMs: 0, periodMs: 800, longWordMs: 0 })).toBe(1000)
+    expect(getChunkDelay(difficult, 300, true, { commaMs: 0, periodMs: 0, longWordMs: 300 })).toBeGreaterThan(getChunkDelay(difficult, 300, true, { commaMs: 0, periodMs: 0, longWordMs: 0 }))
+  })
+
   it('uses the selected WPM exactly when clarity pauses are off', async () => {
     const document = await fixture()
     const chunk = buildChunks(document, 5, 'skim')[0]
     expect(getChunkDelay(chunk, 300, false)).toBe(chunk.tokens.length * 200)
     expect(getChunkDelay(buildChunks(document, 1, 'study')[0], 1000, false)).toBe(60)
+  })
+
+  it('pauses after periods while preserving the selected overall WPM', async () => {
+    const document = await createParsedDocument({
+      format: 'txt',
+      title: 'Pacing',
+      sections: [{ title: 'Pacing', text: 'One two three. Four five six seven eight' }],
+    }, 'pacing.txt')
+    const chunks = buildChunks(document, 1, 'study')
+    const delays = getReadingDelays(chunks, 300, false)
+    const periodIndex = chunks.findIndex((chunk) => chunk.text.endsWith('.'))
+    const ordinaryIndex = chunks.findIndex((chunk) => !chunk.sentenceEnd)
+    expect(delays[periodIndex]).toBeGreaterThan(delays[ordinaryIndex])
+    expect(delays.reduce((sum, delay) => sum + delay, 0)).toBeCloseTo(document.tokens.length * 200)
   })
 
   it('selects a stable focus point and disables it for single CJK characters', () => {

@@ -1,9 +1,9 @@
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   plugins: [react()],
-  base: '/celere-2/',
+  base: command === 'serve' ? '/' : '/celere-2/',
   server: {
     proxy: {
       '/api': 'http://localhost:8787',
@@ -15,4 +15,4 @@ export default defineConfig({
     include: ['src/**/*.test.{ts,tsx}', 'server/**/*.test.mjs'],
     exclude: ['tests/e2e/**', 'node_modules/**', 'dist/**'],
   },
-})
+}))

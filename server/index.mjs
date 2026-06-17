@@ -28,7 +28,8 @@ const defaultEdgeTtsVoice = process.env.EDGE_TTS_DEFAULT_VOICE ?? 'en-US-AriaNeu
 const ffmpegCommand = process.env.FFMPEG_PATH ?? 'ffmpeg'
 const ffprobeCommand = process.env.FFPROBE_PATH ?? 'ffprobe'
 const ytDlpCommand = process.env.YT_DLP_PATH ?? 'yt-dlp'
-const youtubeFormatSelector = 'bv*[height<=720][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[height<=720][vcodec^=avc1][ext=mp4]/bv*[height<=720]+ba/b[height<=720]'
+const youtubeFormatSelector = 'bv[height<=360][vcodec^=avc1][ext=mp4]/bv[height<=360][ext=mp4]/bv[height<=360]/b[height<=360]'
+const youtubePreviewSection = '*0-600'
 const footageUpload = multer({
   storage: multer.diskStorage({
     destination: (_request, _file, callback) => {
@@ -240,12 +241,22 @@ app.post('/api/shortsform/footage', async (request, response) => {
   if (request.body?.rightsConfirmed !== true) {
     return response.status(403).json({ error: 'Confirm that you have permission to download and reuse this footage.' })
   }
-  const sourceUrl = String(request.body?.url ?? '').trim()
-  if (!isYoutubeUrl(sourceUrl)) {
+  const sourceUrl = normalizeYoutubeUrl(request.body?.url)
+  if (!sourceUrl) {
     return response.status(400).json({ error: 'Enter a valid YouTube or youtu.be URL.' })
   }
   if (!commandAvailable(ytDlpCommand)) {
     return response.status(503).json({ error: 'yt-dlp is not installed on this server.' })
+  }
+
+  const cached = findCachedFootage(sourceUrl)
+  if (cached) {
+    return response.json({
+      assetId: cached.assetId,
+      cached: true,
+      previewUrl: `/api/shortsform/footage/${cached.assetId}`,
+      title: cached.title,
+    })
   }
 
   const assetId = randomUUID()
@@ -259,14 +270,17 @@ app.post('/api/shortsform/footage', async (request, response) => {
   try {
     await runProcess(ytDlpCommand, [
       '--no-playlist',
-      '--remote-components', 'ejs:github',
+      '--js-runtimes', 'node',
       '--retries', '3',
       '--fragment-retries', '3',
       '--socket-timeout', '20',
-      '--concurrent-fragments', '4',
+      '--concurrent-fragments', '8',
       '--restrict-filenames',
+      '--no-part',
+      '--no-mtime',
       '--write-info-json',
-      '--merge-output-format', 'mp4',
+      '--download-sections', youtubePreviewSection,
+      '--max-filesize', '350M',
       '-f', youtubeFormatSelector,
       '-o', path.join(assetDir, 'source.%(ext)s'),
       sourceUrl,
@@ -416,10 +430,12 @@ app.get('/api/shortsform/jobs/:jobId/output', (request, response) => {
 
 if (fs.existsSync(distDir)) {
   app.use(express.static(distDir))
+  app.use('/celere-2', express.static(distDir))
   app.get(/^(?!\/api).*/, (_request, response) => response.sendFile(path.join(distDir, 'index.html')))
 }
 
 if (process.env.NODE_ENV !== 'test') {
+  cleanupStaleFootageParts()
   app.listen(port, () => console.log(`Celere server listening on http://localhost:${port}`))
 }
 
@@ -749,12 +765,24 @@ function runProcess(command, args, options = {}) {
 }
 
 function isYoutubeUrl(value) {
+  return Boolean(normalizeYoutubeUrl(value))
+}
+
+function normalizeYoutubeUrl(value) {
   try {
-    const url = new URL(value)
+    const url = new URL(String(value ?? '').trim())
     const host = url.hostname.toLowerCase().replace(/^www\./, '')
-    return url.protocol === 'https:' && ['youtube.com', 'm.youtube.com', 'youtu.be'].includes(host)
+    if (url.protocol !== 'https:' || !['youtube.com', 'm.youtube.com', 'youtu.be'].includes(host)) return ''
+    const segments = url.pathname.split('/').filter(Boolean)
+    const videoId = host === 'youtu.be'
+      ? segments[0]
+      : url.searchParams.get('v')
+        ?? (['shorts', 'embed'].includes(segments[0]) ? segments[1] : '')
+    return /^[\w-]{6,20}$/.test(videoId ?? '')
+      ? `https://www.youtube.com/watch?v=${videoId}`
+      : ''
   } catch {
-    return false
+    return ''
   }
 }
 
@@ -777,6 +805,50 @@ function readDownloadedVideoTitle(directory) {
   } catch {
     return ''
   }
+}
+
+function findCachedFootage(sourceUrl, footageDirectory = path.join(shortsformDir, 'footage')) {
+  if (!fs.existsSync(footageDirectory)) return null
+  for (const assetId of fs.readdirSync(footageDirectory)) {
+    if (!isAssetId(assetId)) continue
+    const assetDir = path.join(footageDirectory, assetId)
+    const metaPath = path.join(assetDir, 'meta.json')
+    const sourcePath = findMediaFile(assetDir)
+    if (!sourcePath || !fs.existsSync(metaPath)) continue
+    try {
+      const metadata = JSON.parse(fs.readFileSync(metaPath, 'utf8'))
+      if (metadata.sourceUrl === sourceUrl) {
+        return {
+          assetId,
+          title: String(metadata.title || 'Authorized footage'),
+        }
+      }
+    } catch {
+      // Ignore incomplete or corrupt cache entries.
+    }
+  }
+  return null
+}
+
+function cleanupStaleFootageParts(
+  footageDirectory = path.join(shortsformDir, 'footage'),
+  now = Date.now(),
+) {
+  if (!fs.existsSync(footageDirectory)) return 0
+  let removed = 0
+  for (const assetId of fs.readdirSync(footageDirectory)) {
+    const assetDir = path.join(footageDirectory, assetId)
+    if (!fs.statSync(assetDir).isDirectory()) continue
+    for (const name of fs.readdirSync(assetDir)) {
+      if (!name.endsWith('.part')) continue
+      const filePath = path.join(assetDir, name)
+      if (now - fs.statSync(filePath).mtimeMs < 60 * 60_000) continue
+      fs.rmSync(filePath, { force: true })
+      removed += 1
+    }
+    if (fs.readdirSync(assetDir).length === 0) fs.rmSync(assetDir, { recursive: true, force: true })
+  }
+  return removed
 }
 
 function getFootagePath(assetId) {
@@ -877,4 +949,14 @@ function escapeFilterPath(filePath) {
   return filePath.replaceAll('\\', '\\\\').replaceAll(':', '\\:').replaceAll("'", "\\'")
 }
 
-export { buildSrt, findMediaFile, isYoutubeUrl, normalizeExportSections, youtubeFormatSelector }
+export {
+  buildSrt,
+  cleanupStaleFootageParts,
+  findCachedFootage,
+  findMediaFile,
+  isYoutubeUrl,
+  normalizeYoutubeUrl,
+  normalizeExportSections,
+  youtubeFormatSelector,
+  youtubePreviewSection,
+}

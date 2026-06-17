@@ -12,6 +12,8 @@ npm run dev
 
 Open `http://localhost:5173`. The local parser and protected AI proxy run on port `8787`.
 
+Set `VITE_CLERK_PUBLISHABLE_KEY` in `.env.local` to enable Clerk authentication. The app will stop at a configuration screen until this value is present. Use the publishable key from your Clerk application, not a secret key.
+
 Set `OPENROUTER_API_KEY` in `.env.local` to enable optional Gemma features. The key is never exposed to the client. Semantic retrieval, exact search, RSVP reading, local summaries, and all core controls work without OpenRouter.
 
 ## Privacy
@@ -29,7 +31,7 @@ Reader settings include image, direct-video, and YouTube background controls. Up
 Shortsform mirrors the original Celere Brainrot mode as an interactive reading surface. It uses the shared document position, full-bleed gameplay, sentence-window captions, per-word narrated state, and chunk-level Edge TTS synchronized to playback.
 
 - Book narration is blocked until the user confirms they own the text or have narration and distribution rights.
-- YouTube footage is downloaded with `yt-dlp` only after a separate reuse-rights confirmation.
+- YouTube footage can be previewed immediately as a muted embed after reuse-rights confirmation. Optional local caching uses `yt-dlp` to save a reusable video-only clip of up to 10 minutes at 360p, with completed URLs reused from cache.
 - Edge TTS receives only the active reading chunk, and playback waits for the adjusted narration duration before advancing.
 - Caption size, line length, case, alignment, theme, voice, rate, pitch, and WPM are configurable.
 - Cached footage and temporary narration files are stored in `.shortsform-cache/`.

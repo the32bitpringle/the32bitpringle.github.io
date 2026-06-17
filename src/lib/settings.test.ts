@@ -11,6 +11,13 @@ describe('reader settings', () => {
     expect(defaultSettings.fontSize).toBeLessThanOrEqual(120)
     expect(defaultSettings.fontWeight).toBeGreaterThanOrEqual(400)
     expect(defaultSettings.fontWeight).toBeLessThanOrEqual(700)
+    expect(defaultSettings.wordFocusTextScale).toBeGreaterThanOrEqual(32)
+    expect(defaultSettings.wordFocusTextScale).toBeLessThanOrEqual(72)
+    expect(defaultSettings.wordFocusLineSpacing).toBeGreaterThanOrEqual(120)
+    expect(defaultSettings.wordFocusLineSpacing).toBeLessThanOrEqual(190)
+    expect(defaultSettings.pauseCommaMs).toBeGreaterThanOrEqual(0)
+    expect(defaultSettings.pausePeriodMs).toBeGreaterThan(defaultSettings.pauseCommaMs)
+    expect(defaultSettings.pauseLongWordMs).toBeGreaterThanOrEqual(0)
     expect(defaultSettings.microBreakDuration).toBeGreaterThanOrEqual(5)
     expect(defaultSettings.microBreakDuration).toBeLessThanOrEqual(20)
     expect(defaultSettings.eyeAnchor).toBe(false)
@@ -31,6 +38,11 @@ describe('reader settings', () => {
       focusWindow: false,
       motionSmoothing: false,
       audioMode: 'off',
+    })
+    expect(sensoryPresets.calm).toMatchObject({
+      theme: 'calm',
+      focusWindow: true,
+      motionSmoothing: true,
     })
     expect(sensoryPresets['low-stim']).toMatchObject({
       theme: 'eink',

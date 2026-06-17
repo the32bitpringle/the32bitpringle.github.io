@@ -26,6 +26,18 @@ export interface ExtractedDocument {
   sections: Array<{ title: string; text: string }>
 }
 
+export interface PauseDurations {
+  commaMs: number
+  periodMs: number
+  longWordMs: number
+}
+
+const DEFAULT_PAUSE_DURATIONS: PauseDurations = {
+  commaMs: 120,
+  periodMs: 240,
+  longWordMs: 160,
+}
+
 export async function createParsedDocument(
   extracted: ExtractedDocument,
   sourceName: string,
@@ -249,13 +261,38 @@ export function buildNarrationPassages(document: ParsedDocument, maxWords = 240)
   return passages
 }
 
-export function getChunkDelay(chunk: ReadingChunk, wpm: number, clarityPauses: boolean) {
+export function getChunkDelay(
+  chunk: ReadingChunk,
+  wpm: number,
+  clarityPauses: boolean,
+  pauses: PauseDurations = DEFAULT_PAUSE_DURATIONS,
+) {
   const base = (60_000 / Math.max(wpm, 1)) * chunk.tokens.length
   if (!clarityPauses) return base
-  const clause = CLAUSE_END.test(chunk.text) ? 120 : 0
-  const sentence = chunk.sentenceEnd ? 240 : 0
-  const difficult = chunk.complexity * 160
+  const clause = CLAUSE_END.test(chunk.text) ? pauses.commaMs : 0
+  const sentence = chunk.sentenceEnd ? pauses.periodMs : 0
+  const difficult = chunk.complexity * pauses.longWordMs
   return base + clause + sentence + difficult
+}
+
+export function getReadingDelays(
+  chunks: ReadingChunk[],
+  wpm: number,
+  clarityPauses: boolean,
+  pauses: PauseDurations = DEFAULT_PAUSE_DURATIONS,
+) {
+  if (chunks.length === 0) return []
+  const millisecondsPerWord = 60_000 / Math.max(wpm, 1)
+  const weights = chunks.map((chunk) => (
+    chunk.tokens.length
+    + (CLAUSE_END.test(chunk.text) ? pauses.commaMs / millisecondsPerWord : 0)
+    + (chunk.sentenceEnd ? pauses.periodMs / millisecondsPerWord : 0)
+    + (clarityPauses ? chunk.complexity * pauses.longWordMs / millisecondsPerWord : 0)
+  ))
+  const totalWords = chunks.reduce((sum, chunk) => sum + chunk.tokens.length, 0)
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0)
+  const scale = totalWeight > 0 ? totalWords / totalWeight : 1
+  return weights.map((weight) => millisecondsPerWord * weight * scale)
 }
 
 export function getFocusPointIndex(word: string) {

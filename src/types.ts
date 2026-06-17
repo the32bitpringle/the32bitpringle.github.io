@@ -1,5 +1,5 @@
 export type ReadingMode = 'skim' | 'deep-focus' | 'study'
-export type ReaderTheme = 'light' | 'paper' | 'sepia' | 'dark' | 'eink' | 'high-contrast'
+export type ReaderTheme = 'light' | 'paper' | 'sepia' | 'dark' | 'calm' | 'eink' | 'high-contrast'
 export type ContrastMode = 'soft' | 'balanced' | 'high'
 export type AudioMode = 'off' | 'brown-noise' | 'binaural-beats' | 'metronome' | 'soft-drums'
 export type SensoryPreset = 'neutral' | 'calm' | 'crisp' | 'low-stim'
@@ -9,6 +9,7 @@ export type AppPage = 'reader' | 'focus' | 'shortsform' | 'guide'
 export type ShortsformSubtitleStyle = 'emphasis' | 'window' | 'plain' | 'karaoke' | 'outline' | 'block' | 'shadow'
 export type ShortsformSubtitleCase = 'uppercase' | 'natural'
 export type ShortsformCaptionAlign = 'center' | 'left'
+export type ShortsformCaptionPosition = 'top' | 'center' | 'bottom'
 export type ReactionKind = 'important' | 'confused' | 'understood'
 export type WordRole = 'normal' | 'subject' | 'verb' | 'key'
 export type ReaderHotkeyAction = 'playPause' | 'previous' | 'next' | 'focusMode' | 'narration' | 'settings' | 'textView'
@@ -136,6 +137,8 @@ export interface Reaction {
   documentId: string
   kind: ReactionKind
   chunkIndex: number
+  wordStart: number
+  wordEnd: number
   preview: string
   createdAt: number
 }
@@ -192,6 +195,8 @@ export interface ReaderSettings {
   fontSize: number
   fontWeight: number
   fontFamily: string
+  wordFocusTextScale: number
+  wordFocusLineSpacing: number
   mode: ReadingMode
   theme: ReaderTheme
   contrast: ContrastMode
@@ -216,6 +221,9 @@ export interface ReaderSettings {
   autoHideTitleDelay: number
   contextLadder: boolean
   clarityPauses: boolean
+  pauseCommaMs: number
+  pausePeriodMs: number
+  pauseLongWordMs: number
   dopamineFeedback: boolean
   quickSenseChecks: boolean
   aiMicroQuizzes: boolean
@@ -246,6 +254,9 @@ export interface ReaderSettings {
   shortsformSubtitleStyle: ShortsformSubtitleStyle
   shortsformSubtitleCase: ShortsformSubtitleCase
   shortsformCaptionAlign: ShortsformCaptionAlign
+  shortsformCaptionPosition: ShortsformCaptionPosition
+  shortsformBackdropDim: number
+  shortsformFootageBlur: number
   shortsformTts: boolean
   shortsformTtsRate: number
   shortsformTtsPitch: number

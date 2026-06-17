@@ -1,5 +1,10 @@
 import type { ReaderSettings, ReadingMode, SensoryPreset } from '../types'
 
+export const DEFAULT_READER_COLORS = {
+  backgroundColor: '#fbfaf4',
+  textColor: '#091717',
+} as const
+
 export const modePresets: Record<ReadingMode, Partial<ReaderSettings>> = {
   skim: { wpm: 420, chunkSize: 4, microBreakInterval: 60, microBreakDuration: 6 },
   'deep-focus': { wpm: 280, chunkSize: 2, microBreakInterval: 40, microBreakDuration: 8 },
@@ -17,7 +22,7 @@ export const sensoryPresets: Record<SensoryPreset, Partial<ReaderSettings>> = {
     audioMode: 'off',
   },
   calm: {
-    theme: 'paper',
+    theme: 'calm',
     contrast: 'soft',
     focusWindow: true,
     focusWindowWidth: 'wide',
@@ -53,11 +58,13 @@ export const defaultSettings: ReaderSettings = {
   fontSize: 72,
   fontWeight: 400,
   fontFamily: "'Times New Roman', serif",
+  wordFocusTextScale: 43,
+  wordFocusLineSpacing: 145,
   mode: 'deep-focus',
   theme: 'paper',
   contrast: 'balanced',
-  textColor: '#091717',
-  backgroundColor: '#fbfaf4',
+  textColor: DEFAULT_READER_COLORS.textColor,
+  backgroundColor: DEFAULT_READER_COLORS.backgroundColor,
   showFocusPoint: true,
   showRoleHighlights: false,
   eyeAnchor: false,
@@ -77,6 +84,9 @@ export const defaultSettings: ReaderSettings = {
   autoHideTitleDelay: 2,
   contextLadder: false,
   clarityPauses: false,
+  pauseCommaMs: 120,
+  pausePeriodMs: 240,
+  pauseLongWordMs: 160,
   dopamineFeedback: false,
   quickSenseChecks: false,
   aiMicroQuizzes: false,
@@ -107,6 +117,9 @@ export const defaultSettings: ReaderSettings = {
   shortsformSubtitleStyle: 'emphasis',
   shortsformSubtitleCase: 'uppercase',
   shortsformCaptionAlign: 'center',
+  shortsformCaptionPosition: 'center',
+  shortsformBackdropDim: 72,
+  shortsformFootageBlur: 0,
   shortsformTts: true,
   shortsformTtsRate: 1,
   shortsformTtsPitch: 1,
@@ -154,5 +167,10 @@ function migrateSettings(value?: Partial<ReaderSettings> | null): Partial<Reader
     backgroundPlaybackRate: value.backgroundPlaybackRate ?? 1,
     backgroundPaused: value.backgroundPaused ?? false,
     backgroundLoop: value.backgroundLoop ?? true,
+    wordFocusTextScale: value.wordFocusTextScale ?? defaultSettings.wordFocusTextScale,
+    wordFocusLineSpacing: value.wordFocusLineSpacing ?? defaultSettings.wordFocusLineSpacing,
+    pauseCommaMs: value.pauseCommaMs ?? defaultSettings.pauseCommaMs,
+    pausePeriodMs: value.pausePeriodMs ?? defaultSettings.pausePeriodMs,
+    pauseLongWordMs: value.pauseLongWordMs ?? defaultSettings.pauseLongWordMs,
   }
 }

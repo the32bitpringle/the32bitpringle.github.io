@@ -6,11 +6,15 @@ import JSZip from 'jszip'
 import { describe, expect, it } from 'vitest'
 import {
   buildSrt,
+  cleanupStaleFootageParts,
+  findCachedFootage,
   extractDocument,
   findMediaFile,
   isYoutubeUrl,
+  normalizeYoutubeUrl,
   normalizeExportSections,
   youtubeFormatSelector,
+  youtubePreviewSection,
 } from './index.mjs'
 
 describe('server document extraction', () => {
@@ -70,13 +74,17 @@ describe('Shortsform inputs', () => {
   it('accepts only HTTPS YouTube footage URLs', () => {
     expect(isYoutubeUrl('https://www.youtube.com/watch?v=abc123')).toBe(true)
     expect(isYoutubeUrl('https://youtu.be/abc123')).toBe(true)
+    expect(normalizeYoutubeUrl('https://youtube.com/shorts/abc123?feature=share')).toBe('https://www.youtube.com/watch?v=abc123')
+    expect(normalizeYoutubeUrl('https://youtu.be/abc123?t=10')).toBe('https://www.youtube.com/watch?v=abc123')
     expect(isYoutubeUrl('http://youtube.com/watch?v=abc123')).toBe(false)
     expect(isYoutubeUrl('https://example.com/video.mp4')).toBe(false)
   })
 
-  it('prefers browser-compatible 720p H.264 YouTube footage', () => {
-    expect(youtubeFormatSelector).toContain('height<=720')
+  it('prefers a compact browser-compatible YouTube background clip', () => {
+    expect(youtubeFormatSelector).toContain('height<=360')
     expect(youtubeFormatSelector).toContain('vcodec^=avc1')
+    expect(youtubeFormatSelector).not.toContain('+ba')
+    expect(youtubePreviewSection).toBe('*0-600')
   })
 
   it('finds every accepted uploaded video extension', () => {
@@ -85,6 +93,49 @@ describe('Shortsform inputs', () => {
       const videoPath = path.join(directory, 'source.m4v')
       fs.writeFileSync(videoPath, 'video')
       expect(findMediaFile(directory)).toBe(videoPath)
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('reuses completed YouTube footage from the local cache', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'celere-cache-'))
+    try {
+      const assetId = '00000000-0000-4000-8000-000000000000'
+      const assetDirectory = path.join(directory, assetId)
+      fs.mkdirSync(assetDirectory)
+      fs.writeFileSync(path.join(assetDirectory, 'source.mp4'), 'video')
+      fs.writeFileSync(path.join(assetDirectory, 'meta.json'), JSON.stringify({
+        sourceUrl: 'https://www.youtube.com/watch?v=cached',
+        title: 'Cached clip',
+      }))
+      expect(findCachedFootage('https://www.youtube.com/watch?v=cached', directory)).toEqual({
+        assetId,
+        title: 'Cached clip',
+      })
+      expect(findCachedFootage('https://www.youtube.com/watch?v=missing', directory)).toBeNull()
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('cleans up only stale incomplete footage fragments', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'celere-parts-'))
+    try {
+      const staleDirectory = path.join(directory, 'stale')
+      const recentDirectory = path.join(directory, 'recent')
+      fs.mkdirSync(staleDirectory)
+      fs.mkdirSync(recentDirectory)
+      const stalePart = path.join(staleDirectory, 'source.mp4.part')
+      const recentPart = path.join(recentDirectory, 'source.mp4.part')
+      fs.writeFileSync(stalePart, 'stale')
+      fs.writeFileSync(recentPart, 'recent')
+      const now = Date.now()
+      fs.utimesSync(stalePart, new Date(now - 2 * 60 * 60_000), new Date(now - 2 * 60 * 60_000))
+
+      expect(cleanupStaleFootageParts(directory, now)).toBe(1)
+      expect(fs.existsSync(stalePart)).toBe(false)
+      expect(fs.existsSync(recentPart)).toBe(true)
     } finally {
       fs.rmSync(directory, { recursive: true, force: true })
     }
