@@ -397,6 +397,18 @@ test('dark mode and focus auto-hide remain user controlled', async ({ page }) =>
 
   await page.mouse.move(200, 200)
   await expect(page.locator('.app-shell')).not.toHaveClass(/focus-ui-hidden/)
+
+  await page.waitForTimeout(3200)
+  await expect(page.locator('.app-shell')).toHaveClass(/focus-ui-hidden/)
+  await page.keyboard.press('Shift')
+  await expect(page.locator('.app-shell')).not.toHaveClass(/focus-ui-hidden/)
+
+  await page.getByRole('navigation', { name: 'Pages' }).getByRole('button', { name: 'Word Focus' }).click()
+  await page.waitForTimeout(3200)
+  await expect(page.locator('.app-shell')).toHaveClass(/focus-ui-hidden/)
+  await expect(page.getByLabel('Word Focus controls')).toBeHidden()
+  await page.mouse.wheel(0, 80)
+  await expect(page.locator('.app-shell')).not.toHaveClass(/focus-ui-hidden/)
 })
 
 test('background customization is available in settings and accepts YouTube', async ({ page }) => {

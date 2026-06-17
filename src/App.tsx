@@ -1020,9 +1020,13 @@ function App({ authControls }: AppProps = {}) {
       titleTimerRef.current = window.setTimeout(() => setTitleVisible(false), settings.autoHideTitleDelay * 1000)
     }
     window.addEventListener('mousemove', reveal)
+    window.addEventListener('pointerdown', reveal)
+    window.addEventListener('touchstart', reveal)
     window.addEventListener('keydown', reveal)
     return () => {
       window.removeEventListener('mousemove', reveal)
+      window.removeEventListener('pointerdown', reveal)
+      window.removeEventListener('touchstart', reveal)
       window.removeEventListener('keydown', reveal)
     }
   }, [playing, settings.autoHideTitle, settings.autoHideTitleDelay])
@@ -1057,10 +1061,18 @@ function App({ authControls }: AppProps = {}) {
     }
     window.addEventListener('pointermove', reveal)
     window.addEventListener('pointerdown', reveal)
+    window.addEventListener('mousemove', reveal)
+    window.addEventListener('wheel', reveal, { passive: true })
+    window.addEventListener('touchstart', reveal, { passive: true })
+    window.addEventListener('keydown', reveal)
     return () => {
       clearTimeout(timer)
       window.removeEventListener('pointermove', reveal)
       window.removeEventListener('pointerdown', reveal)
+      window.removeEventListener('mousemove', reveal)
+      window.removeEventListener('wheel', reveal)
+      window.removeEventListener('touchstart', reveal)
+      window.removeEventListener('keydown', reveal)
     }
   }, [
     calibrationOpen,
