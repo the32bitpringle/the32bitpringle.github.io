@@ -28,6 +28,8 @@ const defaultEdgeTtsVoice = process.env.EDGE_TTS_DEFAULT_VOICE ?? 'en-US-AriaNeu
 const ffmpegCommand = process.env.FFMPEG_PATH ?? 'ffmpeg'
 const ffprobeCommand = process.env.FFPROBE_PATH ?? 'ffprobe'
 const ytDlpCommand = process.env.YT_DLP_PATH ?? 'yt-dlp'
+const shortsformExportWidth = clampInteger(process.env.SHORTSFORM_EXPORT_WIDTH, 360, 1080, 720)
+const shortsformExportHeight = clampInteger(process.env.SHORTSFORM_EXPORT_HEIGHT, 640, 1920, 1280)
 const youtubeFormatSelector = 'bv[height<=360][vcodec^=avc1][ext=mp4]/bv[height<=360][ext=mp4]/bv[height<=360]/b[height<=360]'
 const youtubePreviewSection = '*0-600'
 const footageUpload = multer({
@@ -383,17 +385,17 @@ app.post('/api/shortsform/export', async (request, response) => {
       fs.writeFileSync(subtitlePath, buildSrt(section.text, chapterDuration))
       const subtitleFilter = `subtitles=${escapeFilterPath(subtitlePath)}:force_style='FontName=DejaVu Sans,FontSize=10,Bold=1,Alignment=2,MarginV=78,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.4,Shadow=0.5'`
       await runProcess(ffmpegCommand, [
-        '-y',
+        '-y', '-hide_banner', '-nostats',
         '-stream_loop', '-1',
         '-i', footagePath,
         '-i', audioPath,
-        '-filter_complex', `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,eq=brightness=-0.12[bg];[bg]${subtitleFilter}[video]`,
+        '-filter_complex', `[0:v]scale=${shortsformExportWidth}:${shortsformExportHeight}:force_original_aspect_ratio=increase,crop=${shortsformExportWidth}:${shortsformExportHeight},setsar=1,eq=brightness=-0.12[bg];[bg]${subtitleFilter}[video]`,
         '-map', '[video]',
         '-map', '1:a:0',
         '-t', chapterDuration.toFixed(3),
         '-r', '30',
         '-c:v', 'libx264',
-        '-preset', 'veryfast',
+        '-preset', 'ultrafast',
         '-crf', '23',
         '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
@@ -407,7 +409,7 @@ app.post('/api/shortsform/export', async (request, response) => {
     const concatPath = path.join(jobDir, 'chapters.txt')
     fs.writeFileSync(concatPath, segmentPaths.map((segmentPath) => `file '${segmentPath.replaceAll("'", "'\\''")}'`).join('\n'))
     const outputPath = path.join(jobDir, `${safeFileName(request.body?.title) || 'shortsform-book'}.mp4`)
-    await runProcess(ffmpegCommand, ['-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-c', 'copy', '-movflags', '+faststart', outputPath], { timeoutMs: 60 * 60_000 })
+    await runProcess(ffmpegCommand, ['-y', '-hide_banner', '-nostats', '-f', 'concat', '-safe', '0', '-i', concatPath, '-c', 'copy', '-movflags', '+faststart', outputPath], { timeoutMs: 60 * 60_000 })
     fs.writeFileSync(path.join(jobDir, 'result.json'), JSON.stringify({ outputPath }))
     response.json({
       chapterCount: sections.length,
@@ -425,7 +427,7 @@ app.get('/api/shortsform/jobs/:jobId/output', (request, response) => {
   if (!fs.existsSync(resultPath)) return response.status(404).json({ error: 'Export was not found.' })
   const { outputPath } = JSON.parse(fs.readFileSync(resultPath, 'utf8'))
   if (!outputPath || !fs.existsSync(outputPath)) return response.status(404).json({ error: 'Export file was not found.' })
-  response.download(outputPath)
+  streamMediaFile(request, response, outputPath, path.basename(outputPath))
 })
 
 if (fs.existsSync(distDir)) {
@@ -481,7 +483,7 @@ export async function extractDocument(buffer, extension, fileName) {
     }
   }
   if (extension === '.html' || extension === '.htm') {
-    const source = buffer.toString('utf8')
+    const source = buffer.toString('utf8').replace(/^\s*<!doctype[^>]*>\s*/i, '')
     const normalizedSource = /<(?:!doctype|html)\b/i.test(source)
       ? source
       : `<html><body>${source}</body></html>`
@@ -697,8 +699,14 @@ function findEdgeTtsPython() {
     process.env.EDGE_TTS_PYTHON,
     path.resolve(process.cwd(), '.venv-edge-tts', 'bin', 'python'),
     path.resolve(process.cwd(), ' celere (original)', '.venv-edge-tts', 'bin', 'python'),
+    '/usr/bin/python3',
+    '/usr/local/bin/python3',
   ].filter(Boolean)
-  return candidates.find((candidate) => fs.existsSync(candidate)) ?? ''
+  const python = candidates.find((candidate) =>
+    fs.existsSync(candidate) && spawnSync(candidate, ['-c', 'import edge_tts'], { stdio: 'ignore' }).status === 0,
+  )
+  if (python) return python
+  return spawnSync('python3', ['-c', 'import edge_tts'], { stdio: 'ignore' }).status === 0 ? 'python3' : ''
 }
 
 function edgeTtsAvailable() {
@@ -856,11 +864,12 @@ function getFootagePath(assetId) {
   return findMediaFile(path.join(shortsformDir, 'footage', assetId))
 }
 
-function streamMediaFile(request, response, filePath) {
+function streamMediaFile(request, response, filePath, downloadName = '') {
   const size = fs.statSync(filePath).size
   const range = request.headers.range
   response.type(path.extname(filePath))
   response.setHeader('Accept-Ranges', 'bytes')
+  if (downloadName) response.setHeader('Content-Disposition', `attachment; filename="${downloadName.replace(/["\r\n]/g, '')}"`)
   if (!range) {
     response.setHeader('Content-Length', size)
     fs.createReadStream(filePath).pipe(response)
@@ -909,6 +918,12 @@ function sanitizeEdgeOffset(value, unit) {
 
 function safeFileName(value) {
   return String(value ?? '').trim().replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 100)
+}
+
+function clampInteger(value, min, max, fallback) {
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed)) return fallback
+  return Math.max(min, Math.min(max, parsed))
 }
 
 async function probeDuration(filePath) {
