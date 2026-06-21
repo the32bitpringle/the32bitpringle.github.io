@@ -21,7 +21,19 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 
 const wordExtractor = new WordExtractor()
 const openRouterApiKey = process.env.OPENROUTER_API_KEY ?? ''
 const openRouterModel = process.env.OPENROUTER_MODEL ?? 'google/gemma-4-31b-it:free'
-const shortsformDir = path.resolve(process.cwd(), '.shortsform-cache')
+const allowedOrigins = (process.env.CORS_ORIGINS ?? [
+  'https://celere-reader.web.app',
+  'http://localhost:4173',
+  'http://localhost:5000',
+  'http://localhost:5173',
+  'http://127.0.0.1:4173',
+  'http://127.0.0.1:5000',
+  'http://127.0.0.1:5173',
+].join(','))
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean)
+const shortsformDir = path.resolve(process.env.SHORTSFORM_DIR ?? path.resolve(process.cwd(), '.shortsform-cache'))
 const edgeTtsBridge = path.resolve(process.cwd(), 'server', 'edge_tts_bridge.py')
 const edgeTtsPython = findEdgeTtsPython()
 const defaultEdgeTtsVoice = process.env.EDGE_TTS_DEFAULT_VOICE ?? 'en-US-AriaNeural'
@@ -50,10 +62,25 @@ const footageUpload = multer({
   },
 })
 
-app.use(cors())
+app.set('trust proxy', 1)
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true)
+      return
+    }
+    callback(null, false)
+  },
+}))
 app.use(express.json({ limit: '20mb' }))
 
-app.post('/api/extract', upload.single('file'), async (request, response) => {
+const standardApiLimit = rateLimit({ max: 120, windowMs: 60_000 })
+const aiApiLimit = rateLimit({ max: 20, windowMs: 60_000, message: 'Too many AI requests. Try again in a minute.' })
+const ttsApiLimit = rateLimit({ max: 30, windowMs: 60_000, message: 'Too many narration requests. Try again in a minute.' })
+const exportApiLimit = rateLimit({ max: 5, windowMs: 10 * 60_000, message: 'Too many export requests. Try again later.' })
+const uploadApiLimit = rateLimit({ max: 12, windowMs: 10 * 60_000, message: 'Too many upload requests. Try again later.' })
+
+app.post('/api/extract', standardApiLimit, upload.single('file'), async (request, response) => {
   if (!request.file) return response.status(400).json({ error: 'Choose a document before importing.' })
   try {
     response.json(await extractDocument(request.file.buffer, path.extname(request.file.originalname).toLowerCase(), request.file.originalname))
@@ -62,7 +89,7 @@ app.post('/api/extract', upload.single('file'), async (request, response) => {
   }
 })
 
-app.post('/api/extract-url', async (request, response) => {
+app.post('/api/extract-url', standardApiLimit, async (request, response) => {
   try {
     const sourceUrl = String(request.body?.url ?? '').trim()
     const result = await fetchImportSource(sourceUrl)
@@ -79,7 +106,7 @@ app.post('/api/extract-url', async (request, response) => {
   }
 })
 
-app.post('/api/quiz', async (request, response) => {
+app.post('/api/quiz', aiApiLimit, async (request, response) => {
   if (!openRouterApiKey) return response.status(503).json({ error: 'AI quizzes are not configured.' })
   try {
     response.json(await askGemma({
@@ -92,7 +119,7 @@ app.post('/api/quiz', async (request, response) => {
   }
 })
 
-app.post('/api/context', async (request, response) => {
+app.post('/api/context', aiApiLimit, async (request, response) => {
   if (!openRouterApiKey) return response.status(503).json({ error: 'AI context summaries are not configured.' })
   try {
     response.json(await askGemma({
@@ -107,7 +134,7 @@ app.post('/api/context', async (request, response) => {
   }
 })
 
-app.post('/api/grouping', async (request, response) => {
+app.post('/api/grouping', aiApiLimit, async (request, response) => {
   if (!openRouterApiKey) return response.status(503).json({ error: 'AI symbol grouping is not configured.' })
   try {
     response.json(await askGemma({
@@ -121,7 +148,7 @@ app.post('/api/grouping', async (request, response) => {
   }
 })
 
-app.post('/api/complexity', async (request, response) => {
+app.post('/api/complexity', aiApiLimit, async (request, response) => {
   if (!openRouterApiKey) return response.status(503).json({ error: 'AI complexity analysis is not configured.' })
   try {
     response.json(await askGemma({
@@ -134,7 +161,7 @@ app.post('/api/complexity', async (request, response) => {
   }
 })
 
-app.post('/api/narration-cast', async (request, response) => {
+app.post('/api/narration-cast', aiApiLimit, async (request, response) => {
   if (!openRouterApiKey) return response.status(503).json({ error: 'AI narration casting is not configured.' })
   const voices = Array.isArray(request.body?.voices)
     ? request.body.voices.slice(0, 40).map((voice) => ({
@@ -166,7 +193,7 @@ app.post('/api/narration-cast', async (request, response) => {
   }
 })
 
-app.post('/api/search-answer', async (request, response) => {
+app.post('/api/search-answer', aiApiLimit, async (request, response) => {
   if (!openRouterApiKey) return response.status(503).json({ error: 'AI search answers are not configured.' })
   try {
     response.json(await askGemma({
@@ -181,7 +208,7 @@ app.post('/api/search-answer', async (request, response) => {
   }
 })
 
-app.get('/api/tts/voices', async (_request, response) => {
+app.get('/api/tts/voices', standardApiLimit, async (_request, response) => {
   if (!edgeTtsAvailable()) return response.status(503).json({ error: 'Edge TTS is not installed on this server.' })
   try {
     const output = await runProcess(edgeTtsPython, [edgeTtsBridge, 'voices'])
@@ -191,7 +218,7 @@ app.get('/api/tts/voices', async (_request, response) => {
   }
 })
 
-app.post('/api/tts', async (request, response) => {
+app.post('/api/tts', ttsApiLimit, async (request, response) => {
   if (!edgeTtsAvailable()) return response.status(503).json({ error: 'Edge TTS is not installed on this server.' })
   const text = String(request.body?.text ?? '').trim()
   if (!text) return response.status(400).json({ error: 'TTS text is required.' })
@@ -239,7 +266,7 @@ app.get('/api/shortsform/runtime', (_request, response) => {
   })
 })
 
-app.post('/api/shortsform/footage', async (request, response) => {
+app.post('/api/shortsform/footage', uploadApiLimit, async (request, response) => {
   if (request.body?.rightsConfirmed !== true) {
     return response.status(403).json({ error: 'Confirm that you have permission to download and reuse this footage.' })
   }
@@ -306,7 +333,7 @@ app.post('/api/shortsform/footage', async (request, response) => {
   }
 })
 
-app.post('/api/shortsform/footage/upload', footageUpload.single('file'), (request, response) => {
+app.post('/api/shortsform/footage/upload', uploadApiLimit, footageUpload.single('file'), (request, response) => {
   if (request.body?.rightsConfirmed !== 'true') {
     if (request.file?.path) fs.rmSync(request.file.path, { force: true })
     return response.status(403).json({ error: 'Confirm that you have permission to reuse this footage.' })
@@ -340,7 +367,7 @@ app.get('/api/shortsform/footage/:assetId', (request, response) => {
   streamMediaFile(request, response, sourcePath)
 })
 
-app.post('/api/shortsform/export', async (request, response) => {
+app.post('/api/shortsform/export', exportApiLimit, async (request, response) => {
   if (request.body?.bookRightsConfirmed !== true || request.body?.footageRightsConfirmed !== true) {
     return response.status(403).json({ error: 'Confirm rights for both the book and footage before exporting.' })
   }
@@ -717,6 +744,35 @@ function commandAvailable(command) {
   if (!command) return false
   const versionFlag = /ffmpeg|ffprobe/i.test(path.basename(command)) ? '-version' : '--version'
   return spawnSync(command, [versionFlag], { stdio: 'ignore' }).status === 0
+}
+
+function rateLimit({ max, message = 'Too many requests. Try again later.', windowMs }) {
+  const buckets = new Map()
+  return (request, response, next) => {
+    const now = Date.now()
+    const forwardedFor = String(request.headers['x-forwarded-for'] ?? '').split(',')[0].trim()
+    const ip = forwardedFor || request.ip || request.socket.remoteAddress || 'unknown'
+    const key = `${request.method}:${request.path}:${ip}`
+    const bucket = buckets.get(key)
+    if (!bucket || bucket.resetAt <= now) {
+      buckets.set(key, { count: 1, resetAt: now + windowMs })
+      next()
+      return
+    }
+    bucket.count += 1
+    if (bucket.count > max) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))
+      response.setHeader('Retry-After', String(retryAfterSeconds))
+      response.status(429).json({ error: message })
+      return
+    }
+    if (buckets.size > 10_000) {
+      for (const [bucketKey, value] of buckets) {
+        if (value.resetAt <= now) buckets.delete(bucketKey)
+      }
+    }
+    next()
+  }
 }
 
 function runProcess(command, args, options = {}) {
