@@ -401,6 +401,10 @@ test('dark mode and focus auto-hide remain user controlled', async ({ page }) =>
   await page.waitForTimeout(3200)
   await expect(page.locator('.app-shell')).toHaveClass(/focus-ui-hidden/)
   await page.keyboard.press('Shift')
+  await expect(page.locator('.app-shell')).toHaveClass(/focus-ui-hidden/)
+  await page.keyboard.press('ArrowRight')
+  await expect(page.locator('.app-shell')).toHaveClass(/focus-ui-hidden/)
+  await page.mouse.move(220, 220)
   await expect(page.locator('.app-shell')).not.toHaveClass(/focus-ui-hidden/)
 
   await page.getByRole('navigation', { name: 'Pages' }).getByRole('button', { name: 'Word Focus' }).click()
