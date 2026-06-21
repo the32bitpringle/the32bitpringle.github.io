@@ -15,6 +15,7 @@ import WordExtractor from 'word-extractor'
 
 loadLocalEnv()
 const app = express()
+const isTestRuntime = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST || process.env.NODE_TEST_CONTEXT)
 const port = Number(process.env.PORT ?? 8787)
 const distDir = path.resolve(process.cwd(), 'dist')
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } })
@@ -79,6 +80,17 @@ const aiApiLimit = rateLimit({ max: 20, windowMs: 60_000, message: 'Too many AI 
 const ttsApiLimit = rateLimit({ max: 30, windowMs: 60_000, message: 'Too many narration requests. Try again in a minute.' })
 const exportApiLimit = rateLimit({ max: 5, windowMs: 10 * 60_000, message: 'Too many export requests. Try again later.' })
 const uploadApiLimit = rateLimit({ max: 12, windowMs: 10 * 60_000, message: 'Too many upload requests. Try again later.' })
+
+if (!isTestRuntime) {
+  process.on('unhandledRejection', (error) => {
+    logServerEvent('railway.unhandled_rejection', error)
+  })
+
+  process.on('uncaughtException', (error) => {
+    logServerEvent('railway.uncaught_exception', error)
+    process.exitCode = 1
+  })
+}
 
 app.post('/api/extract', standardApiLimit, upload.single('file'), async (request, response) => {
   if (!request.file) return response.status(400).json({ error: 'Choose a document before importing.' })
@@ -263,12 +275,7 @@ app.post('/api/tts', ttsApiLimit, async (request, response) => {
 
 app.get('/api/shortsform/runtime', (_request, response) => {
   response.json({
-    tools: {
-      edgeTts: edgeTtsAvailable(),
-      ffmpeg: commandAvailable(ffmpegCommand),
-      ffprobe: commandAvailable(ffprobeCommand),
-      ytDlp: commandAvailable(ytDlpCommand),
-    },
+    tools: runtimeTools(),
   })
 })
 
@@ -484,9 +491,19 @@ app.use((error, request, response, _next) => {
   response.status(500).json({ error: 'Internal server error.' })
 })
 
-if (process.env.NODE_ENV !== 'test') {
+if (!isTestRuntime) {
   cleanupStaleFootageParts()
-  app.listen(port, () => console.log(`Celere server listening on http://localhost:${port}`))
+  app.listen(port, () => {
+    logServerInfo('railway.startup', {
+      allowedOrigins,
+      openRouterConfigured: Boolean(openRouterApiKey),
+      openRouterModel,
+      port,
+      shortsformDir,
+      tools: runtimeTools(),
+    })
+    console.log(`Celere server listening on http://localhost:${port}`)
+  })
 }
 
 export async function extractDocument(buffer, extension, fileName) {
@@ -618,6 +635,24 @@ function logServerEvent(event, error, details = {}) {
     details,
     timestamp: new Date().toISOString(),
   }))
+}
+
+function logServerInfo(event, details = {}) {
+  console.log(JSON.stringify({
+    level: 'info',
+    event,
+    details,
+    timestamp: new Date().toISOString(),
+  }))
+}
+
+function runtimeTools() {
+  return {
+    edgeTts: edgeTtsAvailable(),
+    ffmpeg: commandAvailable(ffmpegCommand),
+    ffprobe: commandAvailable(ffprobeCommand),
+    ytDlp: commandAvailable(ytDlpCommand),
+  }
 }
 
 function splitSections(text) {
