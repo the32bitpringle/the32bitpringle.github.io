@@ -253,12 +253,12 @@ app.post('/api/tts', ttsApiLimit, async (request, response) => {
     fs.writeFileSync(textPath, text)
     await runProcess(edgeTtsPython, [
       edgeTtsBridge, 'speak',
-      '--text-file', textPath,
-      '--voice', voice,
-      '--rate', rate,
-      '--pitch', pitch,
-      '--output-file', audioPath,
-      '--timings-file', timingsPath,
+      `--text-file=${textPath}`,
+      `--voice=${voice}`,
+      `--rate=${rate}`,
+      `--pitch=${pitch}`,
+      `--output-file=${audioPath}`,
+      `--timings-file=${timingsPath}`,
     ], { timeoutMs: 60_000 })
     response.setHeader('Content-Type', 'application/json')
     response.setHeader('Cache-Control', 'no-store')
@@ -267,6 +267,10 @@ app.post('/api/tts', ttsApiLimit, async (request, response) => {
       timings: JSON.parse(fs.readFileSync(timingsPath, 'utf8')),
     })
   } catch (error) {
+    logServerEvent('shortsform.tts_failed', error, {
+      textLength: text.length,
+      voice,
+    })
     response.status(502).json({ error: error instanceof Error ? error.message : 'TTS synthesis failed.' })
   } finally {
     fs.rmSync(requestDir, { recursive: true, force: true })
@@ -415,11 +419,11 @@ app.post('/api/shortsform/export', exportApiLimit, async (request, response) => 
       fs.writeFileSync(textPath, section.text)
       await runProcess(edgeTtsPython, [
         edgeTtsBridge, 'speak',
-        '--text-file', textPath,
-        '--voice', voice,
-        '--rate', edgeRate,
-        '--pitch', '+0Hz',
-        '--output-file', audioPath,
+        `--text-file=${textPath}`,
+        `--voice=${voice}`,
+        `--rate=${edgeRate}`,
+        '--pitch=+0Hz',
+        `--output-file=${audioPath}`,
       ], { timeoutMs: 30 * 60_000 })
       const chapterDuration = await probeDuration(audioPath)
       durationSeconds += chapterDuration
