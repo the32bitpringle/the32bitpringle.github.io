@@ -115,6 +115,7 @@ app.post('/api/quiz', aiApiLimit, async (request, response) => {
       validate: (value) => typeof value?.question === 'string' && Array.isArray(value?.options) && value.options.length === 3,
     }))
   } catch (error) {
+    logServerEvent('ai.quiz_failed', error)
     response.status(502).json({ error: error instanceof Error ? error.message : 'Quiz generation failed.' })
   }
 })
@@ -130,6 +131,7 @@ app.post('/api/context', aiApiLimit, async (request, response) => {
       validate: (value) => typeof value?.summary === 'string',
     }))
   } catch (error) {
+    logServerEvent('ai.context_failed', error, { kind: String(request.body?.kind ?? '') })
     response.status(502).json({ error: error instanceof Error ? error.message : 'Summary generation failed.' })
   }
 })
@@ -144,6 +146,7 @@ app.post('/api/grouping', aiApiLimit, async (request, response) => {
         && typeof value?.languageCode === 'string',
     }))
   } catch (error) {
+    logServerEvent('ai.grouping_failed', error)
     response.status(502).json({ error: error instanceof Error ? error.message : 'Symbol grouping failed.' })
   }
 })
@@ -157,6 +160,7 @@ app.post('/api/complexity', aiApiLimit, async (request, response) => {
       validate: (value) => Array.isArray(value?.difficultWords),
     }))
   } catch (error) {
+    logServerEvent('ai.complexity_failed', error)
     response.status(502).json({ error: error instanceof Error ? error.message : 'Complexity analysis failed.' })
   }
 })
@@ -189,6 +193,7 @@ app.post('/api/narration-cast', aiApiLimit, async (request, response) => {
       ),
     })
   } catch (error) {
+    logServerEvent('ai.narration_cast_failed', error)
     response.status(502).json({ error: error instanceof Error ? error.message : 'Narration casting failed.' })
   }
 })
@@ -204,6 +209,7 @@ app.post('/api/search-answer', aiApiLimit, async (request, response) => {
         && Array.isArray(value?.rankedResultNumbers),
     }))
   } catch (error) {
+    logServerEvent('ai.search_answer_failed', error)
     response.status(502).json({ error: error instanceof Error ? error.message : 'Search answer failed.' })
   }
 })
@@ -324,6 +330,7 @@ app.post('/api/shortsform/footage', uploadApiLimit, async (request, response) =>
       title,
     })
   } catch (error) {
+    logServerEvent('shortsform.footage_download_failed', error)
     fs.rmSync(assetDir, { recursive: true, force: true })
     if (!response.destroyed) {
       response.status(502).json({ error: error instanceof Error ? error.message : 'Footage download failed.' })
@@ -444,6 +451,11 @@ app.post('/api/shortsform/export', exportApiLimit, async (request, response) => 
       durationSeconds,
     })
   } catch (error) {
+    logServerEvent('shortsform.export_failed', error, {
+      chapterCount: Array.isArray(request.body?.sections) ? request.body.sections.length : 0,
+      footageAssetId: String(request.body?.footageAssetId ?? '').slice(0, 64),
+      totalCharacters,
+    })
     response.status(502).json({ error: error instanceof Error ? error.message : 'Shortsform export failed.' })
   }
 })
@@ -462,6 +474,15 @@ if (fs.existsSync(distDir)) {
   app.use('/celere-2', express.static(distDir))
   app.get(/^(?!\/api).*/, (_request, response) => response.sendFile(path.join(distDir, 'index.html')))
 }
+
+app.use((error, request, response, _next) => {
+  logServerEvent('railway.http_error', error, {
+    method: request.method,
+    path: request.path,
+  })
+  if (response.headersSent) return
+  response.status(500).json({ error: 'Internal server error.' })
+})
 
 if (process.env.NODE_ENV !== 'test') {
   cleanupStaleFootageParts()
@@ -562,15 +583,41 @@ async function askGemma({ system, input, validate }) {
       }),
       signal: controller.signal,
     })
-    if (!result.ok) throw new Error(`OpenRouter request failed (${result.status}).`)
+    if (!result.ok) {
+      logServerEvent('openrouter.request_failed', new Error(`OpenRouter request failed (${result.status}).`), {
+        model: openRouterModel,
+        status: result.status,
+      })
+      throw new Error(`OpenRouter request failed (${result.status}).`)
+    }
     const payload = await result.json()
     const content = payload?.choices?.[0]?.message?.content
-    const parsed = JSON.parse(content)
-    if (!validate(parsed)) throw new Error('The AI response did not match the required schema.')
+    let parsed
+    try {
+      parsed = JSON.parse(content)
+    } catch (error) {
+      logServerEvent('openrouter.invalid_json', error, { model: openRouterModel })
+      throw error
+    }
+    if (!validate(parsed)) {
+      const error = new Error('The AI response did not match the required schema.')
+      logServerEvent('openrouter.schema_mismatch', error, { model: openRouterModel })
+      throw error
+    }
     return parsed
   } finally {
     clearTimeout(timeout)
   }
+}
+
+function logServerEvent(event, error, details = {}) {
+  console.log(JSON.stringify({
+    level: 'error',
+    event,
+    message: error instanceof Error ? error.message : String(error),
+    details,
+    timestamp: new Date().toISOString(),
+  }))
 }
 
 function splitSections(text) {
