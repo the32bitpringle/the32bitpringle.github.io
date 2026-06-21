@@ -67,12 +67,16 @@ import { isGazePresent } from './lib/gaze'
 import { DEFAULT_READER_COLORS, modePresets, sensoryPresets } from './lib/settings'
 import {
   deleteDocumentData,
+  getAccountQueue,
+  getAccountSession,
   getDocument,
   getQueue,
   getSession,
   loadSettings,
+  putAccountSession,
   putDocument,
   putSession,
+  saveAccountQueueItem,
   saveQueueItem,
   saveSettings,
 } from './lib/storage'
@@ -180,10 +184,11 @@ type Overlay =
   | 'restart'
 
 interface AppProps {
+  accountId?: string
   authControls?: ReactNode
 }
 
-function App({ authControls }: AppProps = {}) {
+function App({ accountId = '', authControls }: AppProps = {}) {
   const [page, setPage] = useState<AppPage>('reader')
   const [settings, setSettings] = useState<ReaderSettings>(loadSettings)
   const [document, setDocument] = useState<ParsedDocument | null>(null)
@@ -371,11 +376,29 @@ function App({ authControls }: AppProps = {}) {
     setChunkIndex(findChunkForWord(focusChunks, wordIndex))
   }, [focusChunks])
 
+  const refreshQueue = useCallback(async () => {
+    const items = accountId ? await getAccountQueue(accountId) : await getQueue()
+    setQueue(items)
+    return items
+  }, [accountId])
+
+  const saveReadingQueueItem = useCallback((item: QueueItem) => (
+    accountId ? saveAccountQueueItem(accountId, item) : saveQueueItem(item)
+  ), [accountId])
+
+  const saveReadingSession = useCallback((session: Parameters<typeof putSession>[0]) => (
+    accountId ? putAccountSession(accountId, session) : putSession(session)
+  ), [accountId])
+
+  const loadReadingSession = useCallback((documentId: string) => (
+    accountId ? getAccountSession(accountId, documentId) : getSession(documentId)
+  ), [accountId])
+
   const persistPosition = useCallback(async (nextChunkIndex = safeChunkIndex) => {
     if (!document) return
     const wordIndex = chunks[nextChunkIndex]?.startWordIndex ?? 0
     await Promise.all([
-      putSession({
+      saveReadingSession({
         documentId: document.id,
         currentWordIndex: wordIndex,
         currentChunkIndex: nextChunkIndex,
@@ -385,7 +408,7 @@ function App({ authControls }: AppProps = {}) {
         bookmarks: [],
         updatedAt: Date.now(),
       }),
-      saveQueueItem({
+      saveReadingQueueItem({
         documentId: document.id,
         title: document.title,
         format: document.format,
@@ -394,8 +417,8 @@ function App({ authControls }: AppProps = {}) {
         savedAt: Date.now(),
       }),
     ])
-    setQueue(await getQueue())
-  }, [chunks, document, metrics, reactions, safeChunkIndex, settings.mode])
+    await refreshQueue()
+  }, [chunks, document, metrics, reactions, refreshQueue, safeChunkIndex, saveReadingQueueItem, saveReadingSession, settings.mode])
   const persistPositionRef = useRef(persistPosition)
   persistPositionRef.current = persistPosition
 
@@ -866,13 +889,19 @@ function App({ authControls }: AppProps = {}) {
 
   useEffect(() => {
     const restoreSettings = restoreSettingsRef.current
-    void getQueue().then(async (items) => {
+    setDocument(null)
+    setChunkIndex(0)
+    setMetrics(EMPTY_METRICS)
+    setReactions([])
+    setOverlay('none')
+    setPlaying(false)
+    void refreshQueue().then(async (items) => {
       setQueue(items)
       if (items[0]) {
         const savedDocument = await getDocument(items[0].documentId)
         if (savedDocument) {
           setDocument(savedDocument)
-          const savedSession = await getSession(savedDocument.id)
+          const savedSession = await loadReadingSession(savedDocument.id)
           if (savedSession) {
             const restoredChunks = buildChunks(savedDocument, restoreSettings.chunkSize, restoreSettings.mode)
             setChunkIndex(findChunkForWord(restoredChunks, savedSession.currentWordIndex))
@@ -886,7 +915,7 @@ function App({ authControls }: AppProps = {}) {
         }
       }
     })
-  }, [])
+  }, [accountId, loadReadingSession, refreshQueue])
 
   useEffect(() => {
     playbackDeadlineRef.current = null
@@ -1481,7 +1510,7 @@ function App({ authControls }: AppProps = {}) {
       setSessionReadingMs(0)
       setReactions([])
       setOverlay('none')
-      await saveQueueItem({
+      await saveReadingQueueItem({
         documentId: parsed.id,
         title: parsed.title,
         format: parsed.format,
@@ -1489,7 +1518,7 @@ function App({ authControls }: AppProps = {}) {
         mode: settings.mode,
         savedAt: Date.now(),
       })
-      setQueue(await getQueue())
+      await refreshQueue()
       setImportOpen(false)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Document import failed.')
@@ -1568,7 +1597,7 @@ function App({ authControls }: AppProps = {}) {
     await deleteDocumentData(document.id, document.hash)
     setDocument(null)
     setChunkIndex(0)
-    setQueue(await getQueue())
+    await refreshQueue()
     setOverlay('none')
   }
 

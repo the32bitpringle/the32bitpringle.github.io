@@ -9,10 +9,12 @@ import type {
 import { defaultSettings, mergeSettings } from './settings'
 
 const DB_NAME = 'celere-v2'
-const DB_VERSION = 1
+const DB_VERSION = 2
 const SETTINGS_KEY = 'celere:v2:settings'
 
-type StoreName = 'documents' | 'sessions' | 'queue' | 'passages' | 'embeddings'
+type StoreName = 'documents' | 'sessions' | 'queue' | 'accountSessions' | 'accountQueue' | 'passages' | 'embeddings'
+type AccountQueueItem = QueueItem & { accountId: string; key: string }
+type AccountReadingSession = ReadingSession & { accountId: string; key: string }
 
 export function loadSettings(): ReaderSettings {
   try {
@@ -53,6 +55,18 @@ export async function getSession(documentId: string) {
   return get<ReadingSession>('sessions', documentId)
 }
 
+export async function putAccountSession(accountId: string, session: ReadingSession) {
+  return put('accountSessions', {
+    ...session,
+    accountId,
+    key: accountDocumentKey(accountId, session.documentId),
+  } satisfies AccountReadingSession)
+}
+
+export async function getAccountSession(accountId: string, documentId: string) {
+  return get<AccountReadingSession>('accountSessions', accountDocumentKey(accountId, documentId))
+}
+
 export async function saveQueueItem(item: QueueItem) {
   await put('queue', item)
   const queue = await getAll<QueueItem>('queue')
@@ -62,6 +76,23 @@ export async function saveQueueItem(item: QueueItem) {
 
 export async function getQueue() {
   return (await getAll<QueueItem>('queue')).sort((a, b) => b.savedAt - a.savedAt)
+}
+
+export async function saveAccountQueueItem(accountId: string, item: QueueItem) {
+  await put('accountQueue', {
+    ...item,
+    accountId,
+    key: accountDocumentKey(accountId, item.documentId),
+  } satisfies AccountQueueItem)
+  const queue = await getAccountQueue(accountId)
+  const stale = queue.sort((a, b) => b.savedAt - a.savedAt).slice(6)
+  await Promise.all(stale.map((entry) => remove('accountQueue', accountDocumentKey(accountId, entry.documentId))))
+}
+
+export async function getAccountQueue(accountId: string) {
+  return (await getAll<AccountQueueItem>('accountQueue'))
+    .filter((item) => item.accountId === accountId)
+    .sort((a, b) => b.savedAt - a.savedAt)
 }
 
 export async function putSemanticIndex(hash: string, passages: SemanticPassage[], embeddings: PassageEmbedding[]) {
@@ -89,10 +120,17 @@ function openDb() {
           db.createObjectStore(store, { keyPath: store === 'queue' ? 'documentId' : store === 'sessions' ? 'documentId' : store === 'documents' ? 'id' : 'key' })
         }
       }
+      for (const store of ['accountSessions', 'accountQueue']) {
+        if (!db.objectStoreNames.contains(store)) db.createObjectStore(store, { keyPath: 'key' })
+      }
     }
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => reject(request.error)
   })
+}
+
+function accountDocumentKey(accountId: string, documentId: string) {
+  return `${accountId}:${documentId}`
 }
 
 async function put(store: StoreName, value: unknown) {

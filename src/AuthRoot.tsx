@@ -4,6 +4,7 @@ import {
   SignUpButton,
   Show,
   UserButton,
+  useAuth,
 } from '@clerk/react'
 import App from './App'
 
@@ -60,6 +61,12 @@ function MissingClerkConfig() {
   )
 }
 
+function SignedInApp() {
+  const { isLoaded, userId } = useAuth()
+  if (!isLoaded || !userId) return null
+  return <App accountId={userId} authControls={<AuthControls />} />
+}
+
 export function AuthRoot() {
   if (authBypass) return <App />
 
@@ -68,7 +75,7 @@ export function AuthRoot() {
   return (
     <ClerkProvider publishableKey={clerkPublishableKey} afterSignOutUrl="/">
       <Show when="signed-in">
-        <App authControls={<AuthControls />} />
+        <SignedInApp />
       </Show>
       <Show when="signed-out">
         <SignedOutScreen />
